@@ -1,0 +1,34 @@
+# macOS
+.DS_Store
+
+# Node
+node_modules/
+npm-debug.log
+yarn-error.log
+dist/
+coverage/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+*.swp
+
+# Android
+.gradle/
+local.properties
+android/local.properties
+android/build/
+android/app/build/
+android/.gradle/
+android/app/.cxx/
+android/capacitor.settings.gradle
+
+# iOS
+ios/DerivedData/
+ios/Pods/
+ios/App/Pods/
+ios/App/App.xcworkspace/xcuserdata/
+ios/App/App.xcodeproj/xcuserdata/
+ios/App/App.xcodeproj/project.xcworkspace/xcuserdata/
+ios/capacitor-cordova-ios-plugins/
