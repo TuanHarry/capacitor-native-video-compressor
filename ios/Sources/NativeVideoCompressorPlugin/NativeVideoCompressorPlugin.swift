@@ -1,6 +1,7 @@
 import Foundation
 import Capacitor
 import AVFoundation
+import UIKit
 
 @objc(NativeVideoCompressorPlugin)
 public class NativeVideoCompressorPlugin: CAPPlugin, CAPBridgedPlugin {
@@ -50,11 +51,27 @@ public class NativeVideoCompressorPlugin: CAPPlugin, CAPBridgedPlugin {
             ])
         }
         
+        // Đăng ký Background Task để ứng dụng tiếp tục nén khi thu nhỏ
+        var backgroundTask: UIBackgroundTaskIdentifier = .invalid
+        
+        // Cần gọi UIBackgroundTaskIdentifier trên Main Thread (nếu an toàn) hoặc dùng trực tiếp (beginBackgroundTask thread-safe)
+        backgroundTask = UIApplication.shared.beginBackgroundTask(withName: "VideoCompression") {
+            // Callback khi hết thời gian chạy ngầm do OS cấp
+            UIApplication.shared.endBackgroundTask(backgroundTask)
+            backgroundTask = .invalid
+        }
+        
         // 5. Bắt đầu tiến trình nén (Chạy ngầm trên GPU)
         exportSession.exportAsynchronously {
             timer.invalidate() // Dừng báo % khi chạy xong
             
             DispatchQueue.main.async {
+                // Kết thúc Background Task khi xử lý xong
+                if backgroundTask != .invalid {
+                    UIApplication.shared.endBackgroundTask(backgroundTask)
+                    backgroundTask = .invalid
+                }
+                
                 switch exportSession.status {
                 case .completed:
                     // THÀNH CÔNG! Trả kết quả về cho Nuxt.js

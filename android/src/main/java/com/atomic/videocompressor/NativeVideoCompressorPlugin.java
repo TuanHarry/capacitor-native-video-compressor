@@ -18,6 +18,7 @@ import androidx.annotation.Nullable;
 
 import java.io.File;
 import java.util.Arrays;
+import android.content.Intent;
 
 @CapacitorPlugin(name = "NativeVideoCompressor")
 public class NativeVideoCompressorPlugin extends Plugin {
@@ -70,6 +71,18 @@ public class NativeVideoCompressorPlugin extends Plugin {
         // 3. Cấu hình nơi lưu (Lưu an toàn vào thư mục nội bộ của App)
         AppSpecificStorageConfiguration storageConfig = new AppSpecificStorageConfiguration("compressed_videos");
 
+        // Khởi động Foreground Service để giữ app luôn sống khi chạy ngầm
+        Intent serviceIntent = new Intent(getContext(), VideoCompressionService.class);
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+            try {
+                getContext().startForegroundService(serviceIntent);
+            } catch (Exception e) {
+                getContext().startService(serviceIntent);
+            }
+        } else {
+            getContext().startService(serviceIntent);
+        }
+
         // 4. Bắt đầu nén (Đã cập nhật List Uri và int index)
         VideoCompressor.start(
                 getContext(),
@@ -91,11 +104,13 @@ public class NativeVideoCompressorPlugin extends Plugin {
 
                     @Override
                     public void onFailure(int i, @NonNull String failureMessage) {
+                        getContext().stopService(serviceIntent);
                         call.reject("Nén thất bại: " + failureMessage);
                     }
 
                     @Override
                     public void onSuccess(int i, long l, @Nullable String s) {
+                        getContext().stopService(serviceIntent);
                         // Nén xong, trả kết quả đường dẫn file mới về cho JS
                         JSObject ret = new JSObject();
                         ret.put("success", true);
@@ -112,6 +127,7 @@ public class NativeVideoCompressorPlugin extends Plugin {
 
                     @Override
                     public void onCancelled(int i) {
+                        getContext().stopService(serviceIntent);
                         call.reject("Đã hủy nén");
                     }
                 }
