@@ -8,7 +8,7 @@ public class NativeVideoCompressorPlugin: CAPPlugin, CAPBridgedPlugin {
     // --- BẮT ĐẦU PHẦN ĐĂNG KÝ PLUGIN (Thay thế cho file .m cũ) ---
     public let identifier = "NativeVideoCompressorPlugin"
     public let jsName = "NativeVideoCompressor"
-    public let pluginMethods: [CAPPluginMethod] =[
+    public let pluginMethods: [CAPPluginMethod] = [
         CAPPluginMethod(name: "compressVideo", returnType: CAPPluginReturnPromise)
     ]
     // --- KẾT THÚC PHẦN ĐĂNG KÝ ---
