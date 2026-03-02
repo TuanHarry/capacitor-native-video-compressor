@@ -1,5 +1,7 @@
 package com.atomic.videocompressor;
 
+import android.util.Log;
+
 import android.net.Uri;
 import java.util.Collections;
 import com.abedelazizshe.lightcompressorlibrary.CompressionListener;
@@ -46,21 +48,30 @@ public class NativeVideoCompressorPlugin extends Plugin {
 
         // Đọc quality từ Javascript (Mặc định là MEDIUM)
         String qualityString = call.getString("quality", "MEDIUM");
+        
         VideoQuality videoQuality = VideoQuality.MEDIUM;
         if (qualityString != null) {
-            try {
-                videoQuality = VideoQuality.valueOf(qualityString);
-            } catch (IllegalArgumentException e) {
-                videoQuality = VideoQuality.MEDIUM;
+            if (qualityString.equals("360P")) {
+                videoQuality = VideoQuality.LOW; // Map 360p to LOW quality on Android
+            } else if (qualityString.equals("LOW")) {
+                videoQuality = VideoQuality.VERY_LOW; // Adjusting others dynamically if needed
+            } else {
+                try {
+                    videoQuality = VideoQuality.valueOf(qualityString);
+                } catch (IllegalArgumentException e) {
+                    videoQuality = VideoQuality.MEDIUM;
+                }
             }
         }
+
+          Log.d("NativeVideoCompressor", "====== VIDEO COMPRESSION QUALITY RECEIVED: " + qualityString + "+ video quality: " + videoQuality + " ======");
 
         // 2. Cấu hình thông số nén (Dành riêng cho LightCompressor 1.3.2)
         // Lưu ý: Java phải truyền đủ 9 tham số do thư viện gốc viết bằng Kotlin
         Configuration configuration = new Configuration(
                 videoQuality, // Chất lượng nén
-                false, // isMinBitrateCheckEnabled
-                null,  // videoBitrateInMbps
+                false, // tắt tính năng giới hạn Bitrate tối thiểu của file gốc
+                null,  // videoBitrateInMbps (Ép buộc giá trị Bitrate để đảm bảo file luôn nhẹ đi)
                 false, // disableAudio
                 false, // keepOriginalResolution
                 null,  // videoWidth

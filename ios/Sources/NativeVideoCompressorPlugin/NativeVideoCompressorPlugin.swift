@@ -13,6 +13,7 @@ public class NativeVideoCompressorPlugin: CAPPlugin, CAPBridgedPlugin {
         CAPPluginMethod(name: "compressVideo", returnType: CAPPluginReturnPromise)
     ]
     // --- KẾT THÚC PHẦN ĐĂNG KÝ ---
+    private var isCompressing = false
 
     @objc func compressVideo(_ call: CAPPluginCall) {
         // 1. Lấy đường dẫn từ Javascript truyền vào
@@ -27,10 +28,33 @@ public class NativeVideoCompressorPlugin: CAPPlugin, CAPBridgedPlugin {
         // Tạo file đầu ra lưu ở thư mục Temp
         let outputURL = FileManager.default.temporaryDirectory.appendingPathComponent("compressed_\(UUID().uuidString).mp4")
         
+        // Lấy thông số chất lượng truyền từ giao diện (Mặc định là MEDIUM nếu không có)
+        let qualityStr = call.getString("quality") ?? "MEDIUM"
+        var presetName: String
+        
+        print("====== VIDEO COMPRESSION QUALITY RECEIVED: \(qualityStr) ======")
+        
+        switch qualityStr {
+        case "VERY_HIGH":
+            presetName = AVAssetExportPresetHighestQuality
+        case "HIGH":
+            presetName = AVAssetExportPreset1280x720 // 720p cho mức High để nhận thấy sự giảm dung lượng rõ rệt
+        case "MEDIUM":
+            presetName = AVAssetExportPreset960x540 // 540p cho mức Medium
+        case "LOW":
+            presetName = AVAssetExportPreset640x480 // 480p cho mức Low
+        case "360P" :
+            presetName = AVAssetExportPresetMediumQuality // 360p cho mức 
+        case "VERY_LOW":
+            presetName = AVAssetExportPresetLowQuality // 124 cho mức Very Low
+        default:
+            presetName = AVAssetExportPreset960x540
+        }
+        
         let asset = AVAsset(url: videoURL)
         
-        // 3. Khởi tạo bộ nén phần cứng (Chọn chất lượng MediumQuality hoặc 1280x720)
-        guard let exportSession = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetMediumQuality) else {
+        // 3. Khởi tạo bộ nén phần cứng với preset tương ứng
+        guard let exportSession = AVAssetExportSession(asset: asset, presetName: presetName) else {
             call.reject("Không thể khởi tạo bộ nén iOS")
             return
         }
@@ -42,14 +66,9 @@ public class NativeVideoCompressorPlugin: CAPPlugin, CAPBridgedPlugin {
         // Báo cho giao diện biết là đã bắt đầu nén
         self.notifyListeners("onProgress", data:["status": "started"])
         
-        // 4. Timer báo % tiến trình về cho Frontend (Cập nhật mỗi 0.1s)
-        let timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { _ in
-            let progress = exportSession.progress * 100
-            self.notifyListeners("onProgress", data: [
-                "status": "progress",
-                "percent": progress
-            ])
-        }
+        self.isCompressing = true
+        let startTime = Date()
+        self.checkProgress(session: exportSession)
         
         // Đăng ký Background Task để ứng dụng tiếp tục nén khi thu nhỏ
         var backgroundTask: UIBackgroundTaskIdentifier = .invalid
@@ -63,7 +82,9 @@ public class NativeVideoCompressorPlugin: CAPPlugin, CAPBridgedPlugin {
         
         // 5. Bắt đầu tiến trình nén (Chạy ngầm trên GPU)
         exportSession.exportAsynchronously {
-            timer.invalidate() // Dừng báo % khi chạy xong
+            self.isCompressing = false
+            let elapsed = Date().timeIntervalSince(startTime)
+            print("Compression finished in \(elapsed) seconds. Final status: \(exportSession.status.rawValue)")
             
             DispatchQueue.main.async {
                 // Kết thúc Background Task khi xử lý xong
@@ -86,6 +107,21 @@ public class NativeVideoCompressorPlugin: CAPPlugin, CAPBridgedPlugin {
                 default:
                     call.reject("Lỗi không xác định")
                 }
+            }
+        }
+    }
+    
+    private func checkProgress(session: AVAssetExportSession) {
+        let progress = session.progress * 100
+        print("Export Progress: \(progress)%") // Log để debug
+        self.notifyListeners("onProgress", data: [
+            "status": "progress",
+            "percent": Double(progress)
+        ])
+        
+        if self.isCompressing && (session.status == .exporting || session.status == .waiting || session.status == .unknown) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+                self?.checkProgress(session: session)
             }
         }
     }
