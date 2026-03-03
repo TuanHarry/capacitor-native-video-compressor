@@ -3,7 +3,7 @@ import type { PluginListenerHandle } from '@capacitor/core';
 export interface CompressOptions {
   sourcePath: string;
   destPath?: string;
-  quality?: 'VERY_HIGH' | 'HIGH' | 'MEDIUM' | 'LOW' | 'VERY_LOW';
+  quality?: 'VERY_HIGH' | 'HIGH' | 'MEDIUM' | 'LOW' | 'VERY_LOW' | '360P';
 }
 
 export interface CompressResult {

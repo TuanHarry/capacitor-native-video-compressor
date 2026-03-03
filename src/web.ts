@@ -1,7 +1,8 @@
 import { WebPlugin } from '@capacitor/core';
-import type { NativeVideoCompressorPlugin, CompressOptions, CompressResult } from './definitions';
 import { FFmpeg } from '@ffmpeg/ffmpeg';
 import { fetchFile, toBlobURL } from '@ffmpeg/util';
+
+import type { NativeVideoCompressorPlugin, CompressOptions, CompressResult } from './definitions';
 
 export class NativeVideoCompressorWeb extends WebPlugin implements NativeVideoCompressorPlugin {
   private ffmpeg: FFmpeg | null = null;
@@ -71,29 +72,41 @@ export class NativeVideoCompressorWeb extends WebPlugin implements NativeVideoCo
       const inputFileName = 'input.mp4';
       const outputFileName = 'output.mp4';
 
-      // Map quality to CRF and Preset
+      // Map quality to CRF, Scale, and Audio Bitrate
       let crf = '28';
       let scale = ''; // default keep resolution
+      let audioBitrate = '128k';
+
       switch (quality) {
         case 'VERY_HIGH': // 1080p
           crf = '23';
           scale = '-vf scale=-2:1080';
+          audioBitrate = '128k';
           break;
         case 'HIGH': // 720p
           crf = '28';
           scale = '-vf scale=-2:720';
+          audioBitrate = '128k';
           break;
         case 'MEDIUM': // 540p
           crf = '30';
           scale = '-vf scale=-2:540';
+          audioBitrate = '96k';
           break;
         case 'LOW': // 480p
           crf = '32';
           scale = '-vf scale=-2:480';
+          audioBitrate = '96k';
+          break;
+        case '360P': // 360p
+          crf = '28';
+          scale = '-vf scale=-2:360';
+          audioBitrate = '64k';
           break;
         case 'VERY_LOW': // 240p
           crf = '35';
           scale = '-vf scale=-2:240';
+          audioBitrate = '48k';
           break;
       }
 
@@ -115,18 +128,18 @@ export class NativeVideoCompressorWeb extends WebPlugin implements NativeVideoCo
       }
 
       // Construct FFmpeg command array
-      let args: string[] = ['-i', inputFileName];
+      const args: string[] = ['-i', inputFileName];
 
-      // Video codec and compression parameters
-      args.push('-c:v', 'libx264', '-preset', 'ultrafast', '-crf', crf);
+      // Video codec and compression parameters (superfast provides much better size than ultrafast)
+      args.push('-c:v', 'libx264', '-preset', 'superfast', '-crf', crf);
 
       // Resize if needed (split by space)
       if (scale) {
         args.push(...scale.split(' '));
       }
 
-      // Audio copy to save time and processing
-      args.push('-c:a', 'aac', '-b:a', '128k');
+      // Audio re-encoding to save space
+      args.push('-c:a', 'aac', '-b:a', audioBitrate);
 
       // Output
       args.push(outputFileName);

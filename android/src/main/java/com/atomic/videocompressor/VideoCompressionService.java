@@ -7,7 +7,6 @@ import android.app.Service;
 import android.content.Intent;
 import android.os.Build;
 import android.os.IBinder;
-
 import androidx.annotation.Nullable;
 import androidx.core.app.NotificationCompat;
 
@@ -25,11 +24,11 @@ public class VideoCompressionService extends Service {
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
         Notification notification = new NotificationCompat.Builder(this, CHANNEL_ID)
-                .setContentTitle("Đang nén video")
-                .setContentText("Tiến trình đang chạy ngầm...")
-                .setSmallIcon(android.R.drawable.ic_popup_sync)
-                .setPriority(NotificationCompat.PRIORITY_LOW)
-                .build();
+            .setContentTitle("Đang nén video")
+            .setContentText("Tiến trình đang chạy ngầm...")
+            .setSmallIcon(android.R.drawable.ic_popup_sync)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .build();
 
         // Check for Android 14+ specific foreground service typing requirements if compiled against API 34+
         // In this case, we rely on the manifest declaration for dataSync.
@@ -51,9 +50,9 @@ public class VideoCompressionService extends Service {
     private void createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             NotificationChannel serviceChannel = new NotificationChannel(
-                    CHANNEL_ID,
-                    "Video Compression Service Channel",
-                    NotificationManager.IMPORTANCE_LOW
+                CHANNEL_ID,
+                "Video Compression Service Channel",
+                NotificationManager.IMPORTANCE_LOW
             );
             NotificationManager manager = getSystemService(NotificationManager.class);
             if (manager != null) {
