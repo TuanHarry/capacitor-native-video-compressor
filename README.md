@@ -15,6 +15,26 @@ npx cap sync
 - **Android**: Uses `LightCompressor` (MediaCodec hardware accelerated).
 - **Web**: Uses `@ffmpeg/ffmpeg` (WebAssembly).
 
+## Native Configuration
+
+### iOS
+
+Remember to add the following to your `Info.plist` if you are picking videos from the Photo Library before compressing them:
+
+```xml
+<key>NSPhotoLibraryUsageDescription</key>
+<string>We need access to your photo library to select videos for compression.</string>
+```
+
+### Android
+
+If you are reading videos from external storage, ensure you have the appropriate permissions in your `AndroidManifest.xml`:
+
+```xml
+<uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
+<uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+```
+
 ## Web Configuration (Required)
 
 To use video compression on the Web platform, `FFmpeg.wasm` requires `SharedArrayBuffer` to function properly. You must configure your web server/framework to serve these specific HTTP headers:
@@ -103,6 +123,26 @@ try {
 // 3. Remove listener when done
 listener.remove();
 ```
+
+### Quality Presets
+
+The `quality` parameter determines the output resolution and compression ratio. Depending on the original aspect ratio, the video will be scaled to match the following heights (or widths, preserving aspect ratio):
+
+| Preset      | Target Resolution | Best For                                  |
+| ----------- | ----------------- | ----------------------------------------- |
+| `VERY_HIGH` | ~ 1080p           | Preserving original high quality          |
+| `HIGH`      | ~ 720p            | Good balance for social media sharing     |
+| `MEDIUM`    | ~ 540p            | Efficient storage and decent quality      |
+| `LOW`       | ~ 480p            | Standard low-bandwidth usage              |
+| `360P`      | ~ 360p            | Very small files                          |
+| `VERY_LOW`  | ~ 240p            | Extreme compression, noticeably pixelated |
+
+> **Note on Web Platform**: On Web, lower qualities also aggressively reduce the Audio Bitrate (down to 48kbps for VERY_LOW) to maximize space savings. On Native, audio maintains steady quality.
+
+### Platform Differences for `sourcePath`
+
+- **iOS/Android**: `sourcePath` must be a physical device file path (e.g., `file:///var/mobile/...` or `content://...`). Do not pass paths obtained from the Capacitor `WebView` (like `http://localhost/...`).
+- **Web**: `sourcePath` can be a Blob URL (e.g., `blob:http://localhost:3000/...`), a base64 Data URI, or a direct link to a file if CORS allows.
 
 ## API
 
