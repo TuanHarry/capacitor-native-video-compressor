@@ -14,6 +14,8 @@ export interface CompressResult {
 export interface NativeVideoCompressorPlugin {
   compressVideo(options: CompressOptions): Promise<CompressResult>;
 
+  initialize(): Promise<{ success: boolean; message?: string }>;
+
   // Đã sửa lại chuẩn cho Capacitor mới nhất (chỉ trả về Promise)
   addListener(
     eventName: 'onProgress',

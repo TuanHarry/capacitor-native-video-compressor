@@ -14,6 +14,7 @@ npx cap sync
 <docgen-index>
 
 * [`compressVideo(...)`](#compressvideo)
+* [`initialize()`](#initialize)
 * [`addListener('onProgress', ...)`](#addlisteneronprogress-)
 * [Interfaces](#interfaces)
 
@@ -33,6 +34,17 @@ compressVideo(options: CompressOptions) => Promise<CompressResult>
 | **`options`** | <code><a href="#compressoptions">CompressOptions</a></code> |
 
 **Returns:** <code>Promise&lt;<a href="#compressresult">CompressResult</a>&gt;</code>
+
+--------------------
+
+
+### initialize()
+
+```typescript
+initialize() => Promise<{ success: boolean; message?: string; }>
+```
+
+**Returns:** <code>Promise&lt;{ success: boolean; message?: string; }&gt;</code>
 
 --------------------
 
