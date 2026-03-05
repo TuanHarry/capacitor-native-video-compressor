@@ -1,6 +1,6 @@
 {
   "name": "capacitor-native-video-compressor",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "Native video compressor using LightCompressor and AVFoundation",
   "main": "dist/plugin.cjs.js",
   "module": "dist/esm/index.js",
