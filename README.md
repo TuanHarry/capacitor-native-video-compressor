@@ -124,6 +124,51 @@ try {
 listener.remove();
 ```
 
+### 3. Cancelling a Compression
+
+Compressing a long video runs for minutes, so give the user a way out. Pass a
+`jobId` when starting, then cancel with the same id:
+
+```typescript
+import { NativeVideoCompressor, CANCELLED } from 'capacitor-native-video-compressor';
+
+const jobId = crypto.randomUUID();
+
+try {
+  const result = await NativeVideoCompressor.compressVideo({
+    sourcePath: '/path/to/video.mp4',
+    quality: 'HIGH',
+    jobId,
+  });
+} catch (error) {
+  if (error.code === CANCELLED) {
+    // The user asked for this — no error toast, no retry prompt.
+    return;
+  }
+  throw error;
+}
+
+// From a Cancel button, anywhere:
+await NativeVideoCompressor.cancel({ jobId });
+```
+
+**Why `jobId`.** Every platform compresses one video at a time, so cancellation
+is global by nature. Two independent queues in the same app (say comments and
+notes) would otherwise cancel each other's work. `cancel()` with no `jobId`
+cancels whatever is running, whoever started it — fine when there is only one
+caller.
+
+**What it costs.** The partial output is deleted on every platform. On web,
+cancelling terminates the FFmpeg worker, because `ffmpeg.exec()` runs as
+synchronous WASM inside it and never reaches a message poll while encoding —
+the `AbortSignal` `exec()` accepts only rejects the main-thread promise while
+the encode keeps burning CPU behind it. The loaded core is dropped with the
+worker, but the core URLs are cached in module scope, so the next compress
+re-instantiates without re-downloading the wasm.
+
+`cancel()` resolves `{ cancelled: false }` when nothing was running, or when a
+different job was — it never throws.
+
 ### Quality Presets
 
 The `quality` parameter determines the output resolution and compression ratio. Depending on the original aspect ratio, the video will be scaled to match the following heights (or widths, preserving aspect ratio):
@@ -149,6 +194,7 @@ The `quality` parameter determines the output resolution and compression ratio. 
 <docgen-index>
 
 * [`compressVideo(...)`](#compressvideo)
+* [`cancel(...)`](#cancel)
 * [`initialize()`](#initialize)
 * [`addListener('onProgress', ...)`](#addlisteneronprogress-)
 * [Interfaces](#interfaces)
@@ -169,6 +215,28 @@ compressVideo(options: CompressOptions) => Promise<CompressResult>
 | **`options`** | <code><a href="#compressoptions">CompressOptions</a></code> |
 
 **Returns:** <code>Promise&lt;<a href="#compressresult">CompressResult</a>&gt;</code>
+
+--------------------
+
+
+### cancel(...)
+
+```typescript
+cancel(options?: CancelOptions | undefined) => Promise<CancelResult>
+```
+
+Stop the compress that is running now. `compressVideo` then rejects with
+code {@link CANCELLED} and its partial output is deleted.
+
+This is the only way to stop one: the work is synchronous WASM inside a
+web worker (web) or an AVFoundation / LightCompressor pass on its own
+thread (native), and none of them watch an AbortSignal.
+
+| Param         | Type                                                    |
+| ------------- | ------------------------------------------------------- |
+| **`options`** | <code><a href="#canceloptions">CancelOptions</a></code> |
+
+**Returns:** <code>Promise&lt;<a href="#cancelresult">CancelResult</a>&gt;</code>
 
 --------------------
 
@@ -213,11 +281,26 @@ addListener(eventName: 'onProgress', listenerFunc: (info: { status: string; perc
 
 #### CompressOptions
 
-| Prop             | Type                                                                            |
-| ---------------- | ------------------------------------------------------------------------------- |
-| **`sourcePath`** | <code>string</code>                                                             |
-| **`destPath`**   | <code>string</code>                                                             |
-| **`quality`**    | <code>'VERY_HIGH' \| 'HIGH' \| 'MEDIUM' \| 'LOW' \| 'VERY_LOW' \| '360P'</code> |
+| Prop             | Type                                                                            | Description                                                                                                                                                                                                                                                                                                                                              |
+| ---------------- | ------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **`sourcePath`** | <code>string</code>                                                             |                                                                                                                                                                                                                                                                                                                                                          |
+| **`destPath`**   | <code>string</code>                                                             |                                                                                                                                                                                                                                                                                                                                                          |
+| **`quality`**    | <code>'VERY_HIGH' \| 'HIGH' \| 'MEDIUM' \| 'LOW' \| 'VERY_LOW' \| '360P'</code> |                                                                                                                                                                                                                                                                                                                                                          |
+| **`jobId`**      | <code>string</code>                                                             | Names this compress so `cancel({ jobId })` can target it. Every platform compresses one video at a time, so cancellation is global by nature. Two independent callers in the same app (say a comment queue and a notes queue) therefore need a way to say *which* job they mean — without one, a cancel from either kills whatever the other is running. |
+
+
+#### CancelResult
+
+| Prop            | Type                 | Description                                                  |
+| --------------- | -------------------- | ------------------------------------------------------------ |
+| **`cancelled`** | <code>boolean</code> | False when nothing was running, or when a different job was. |
+
+
+#### CancelOptions
+
+| Prop        | Type                | Description                                                                                               |
+| ----------- | ------------------- | --------------------------------------------------------------------------------------------------------- |
+| **`jobId`** | <code>string</code> | Only cancel if this is the job currently running. Omit to cancel whatever is running, whoever started it. |
 
 
 #### PluginListenerHandle

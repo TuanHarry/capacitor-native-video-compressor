@@ -2,11 +2,61 @@ import { WebPlugin } from '@capacitor/core';
 import { FFmpeg } from '@ffmpeg/ffmpeg';
 import { fetchFile, toBlobURL } from '@ffmpeg/util';
 
-import type { NativeVideoCompressorPlugin, CompressOptions, CompressResult } from './definitions';
+import type {
+  NativeVideoCompressorPlugin,
+  CompressOptions,
+  CompressResult,
+  CancelOptions,
+  CancelResult,
+} from './definitions';
+import { CANCELLED } from './definitions';
+
+/**
+ * Rejection shape for a cancelled compress. `code` matches what `call.reject`
+ * puts on the error object on iOS/Android, so one `error.code === 'CANCELLED'`
+ * check works on every platform.
+ */
+class CancelledError extends Error {
+  code = CANCELLED;
+  constructor() {
+    super('Đã hủy nén');
+    this.name = 'CancelledError';
+  }
+}
+
+const CORE_BASE_URL = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm';
+
+/**
+ * Cancelling means terminating the worker, which drops the loaded core with
+ * it — so without this the next compress re-downloads ~30 MB of wasm and
+ * "cancel" quietly costs more than it saves. Module scope, not instance: the
+ * bytes are identical for every instance and every job.
+ */
+let corePromise: Promise<{ coreURL: string; wasmURL: string }> | null = null;
+
+const loadCoreURLs = () => {
+  if (!corePromise) {
+    corePromise = Promise.all([
+      toBlobURL(`${CORE_BASE_URL}/ffmpeg-core.js`, 'text/javascript'),
+      toBlobURL(`${CORE_BASE_URL}/ffmpeg-core.wasm`, 'application/wasm'),
+    ])
+      .then(([coreURL, wasmURL]) => ({ coreURL, wasmURL }))
+      .catch((e) => {
+        // Don't cache a failure — a flaky network shouldn't make every later
+        // compress in this session fail too.
+        corePromise = null;
+        throw e;
+      });
+  }
+  return corePromise;
+};
 
 export class NativeVideoCompressorWeb extends WebPlugin implements NativeVideoCompressorPlugin {
   private ffmpeg: FFmpeg | null = null;
   private isLoaded = false;
+  /** The job `compressVideo` is running right now, for `cancel({ jobId })`. */
+  private currentJobId: string | null = null;
+  private cancelRequested = false;
 
   private async loadFFmpeg() {
     if (this.isLoaded && this.ffmpeg) return;
@@ -28,13 +78,8 @@ export class NativeVideoCompressorWeb extends WebPlugin implements NativeVideoCo
 
       // Use standard single-threaded version for best compatibility across browsers
       // without requiring complex SharedArrayBuffer headers configuration
-      const baseURL = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm';
-
-      console.log('Starting to load FFmpeg core from:', baseURL);
-      await this.ffmpeg.load({
-        coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript'),
-        wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm'),
-      });
+      console.log('Starting to load FFmpeg core from:', CORE_BASE_URL);
+      await this.ffmpeg.load(await loadCoreURLs());
 
       this.isLoaded = true;
       console.log('FFmpeg core loaded successfully');
@@ -42,6 +87,28 @@ export class NativeVideoCompressorWeb extends WebPlugin implements NativeVideoCo
       console.error('Failed to load FFmpeg:', e);
       throw e;
     }
+  }
+
+  /**
+   * Kill the worker outright — there is no gentler option.
+   *
+   * `ffmpeg.exec()` runs *synchronously* inside the worker (see
+   * @ffmpeg/ffmpeg's worker.js: `ffmpeg.exec(...args)` is not awaited), so the
+   * worker never reaches a message poll while encoding. The AbortSignal that
+   * `exec()` accepts only rejects the main-thread promise; the encode keeps
+   * burning CPU behind it. `worker.terminate()` is what actually stops it.
+   *
+   * The cost is the loaded core, which is why the core URLs are cached above.
+   */
+  async cancel(options?: CancelOptions): Promise<CancelResult> {
+    if (!this.currentJobId) return { cancelled: false };
+    if (options?.jobId && options.jobId !== this.currentJobId) return { cancelled: false };
+
+    this.cancelRequested = true;
+    this.ffmpeg?.terminate();
+    this.ffmpeg = null;
+    this.isLoaded = false;
+    return { cancelled: true };
   }
 
   async initialize(): Promise<{ success: boolean; message?: string }> {
@@ -57,10 +124,22 @@ export class NativeVideoCompressorWeb extends WebPlugin implements NativeVideoCo
   }
 
   async compressVideo(options: CompressOptions): Promise<CompressResult> {
+    this.currentJobId = options.jobId ?? 'default';
+    this.cancelRequested = false;
+
+    // Checked at every stage boundary, not just around exec: terminate() only
+    // reaches work that has already got to the worker, so a cancel during the
+    // core download or the source fetch has nothing to interrupt and would
+    // otherwise let the compress carry on as if nothing had happened.
+    const throwIfCancelled = () => {
+      if (this.cancelRequested) throw new CancelledError();
+    };
+
     try {
       if (!this.isLoaded) {
         await this.loadFFmpeg();
       }
+      throwIfCancelled();
 
       if (!this.ffmpeg) {
         throw new Error('FFmpeg failed to load');
@@ -118,14 +197,17 @@ export class NativeVideoCompressorWeb extends WebPlugin implements NativeVideoCo
         console.error('[FFmpeg] Error fetching source file:', err);
         throw new Error('Could not fetch source video file');
       }
+      throwIfCancelled();
 
       console.log('[FFmpeg] Writing file to FS...', inputData.byteLength, 'bytes');
       try {
         await this.ffmpeg.writeFile(inputFileName, inputData);
       } catch (err) {
+        if (this.cancelRequested) throw new CancelledError();
         console.error('[FFmpeg] Error writing to FS:', err);
         throw new Error('Could not write to FFmpeg FS');
       }
+      throwIfCancelled();
 
       // Construct FFmpeg command array
       const args: string[] = ['-i', inputFileName];
@@ -149,15 +231,20 @@ export class NativeVideoCompressorWeb extends WebPlugin implements NativeVideoCo
         const retCode = await this.ffmpeg.exec(args);
         console.log('[FFmpeg] Exec returned code:', retCode);
       } catch (err) {
+        // terminate() rejects every in-flight call, so a cancel arrives here
+        // looking like a generic failure unless we name it.
+        if (this.cancelRequested) throw new CancelledError();
         console.error('[FFmpeg] Error executing command:', err);
         throw new Error('FFmpeg execution failed');
       }
+      throwIfCancelled();
 
       console.log('[FFmpeg] Reading output file...');
       let data: any;
       try {
         data = await this.ffmpeg.readFile(outputFileName);
       } catch (err) {
+        if (this.cancelRequested) throw new CancelledError();
         console.error('[FFmpeg] Error reading output file:', err);
         throw new Error('Could not read FFmpeg output');
       }
@@ -177,8 +264,15 @@ export class NativeVideoCompressorWeb extends WebPlugin implements NativeVideoCo
         destPath: destPath,
       };
     } catch (error: any) {
-      console.error('[FFmpeg] Compression process failed:', error);
+      if (error?.code === CANCELLED) {
+        console.log('[FFmpeg] Compression cancelled');
+      } else {
+        console.error('[FFmpeg] Compression process failed:', error);
+      }
       throw error;
+    } finally {
+      this.currentJobId = null;
+      this.cancelRequested = false;
     }
   }
 }

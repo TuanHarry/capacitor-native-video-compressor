@@ -8,18 +8,70 @@ public class NativeVideoCompressorPlugin: CAPPlugin, CAPBridgedPlugin {
     
     public let identifier = "NativeVideoCompressorPlugin"
     public let jsName = "NativeVideoCompressor"
+    // Every method callable from JS must be listed here. `initialize` was
+    // missing, so calling it threw "not implemented" on device — harmless
+    // (the web build needs it, native doesn't) but it buried a real signal in
+    // a console error every single compress.
     public let pluginMethods:[CAPPluginMethod] = [
-        CAPPluginMethod(name: "compressVideo", returnType: CAPPluginReturnPromise)
+        CAPPluginMethod(name: "compressVideo", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "cancel", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "initialize", returnType: CAPPluginReturnPromise)
     ]
-    
+
     private var isCompressing = false
+    /// The job `compressVideo` is running right now, for `cancel(jobId:)`.
+    private var currentJobId: String?
+    private var isCancelled = false
+    /// Held only so `cancel` can stop it; the compress owns it otherwise.
+    private var currentReader: AVAssetReader?
+    /// Guards the three fields above — `cancel` arrives on the main thread
+    /// while the reader is being driven from the compression queues.
+    private let stateLock = NSLock()
+
+    /// Nothing to do natively; AVFoundation needs no warm-up. Answered rather
+    /// than left unimplemented so a caller can await it unconditionally.
+    @objc func initialize(_ call: CAPPluginCall) {
+        call.resolve(["success": true, "message": "No initialization needed on iOS"])
+    }
+
+    /**
+     * Stop the running compress.
+     *
+     * `cancelReading()` is all it takes: the frame loops below already check
+     * `reader.status == .reading` every pass, so a cancelled reader sends them
+     * down the `else` branch — `markAsFinished()`, `group.leave()` — and the
+     * existing completion handler runs. No new exit path, no polling.
+     */
+    @objc func cancel(_ call: CAPPluginCall) {
+        stateLock.lock()
+        let running = currentJobId
+        let requested = call.getString("jobId")
+        // A cancel for a job that isn't the one running would otherwise kill
+        // an unrelated caller's compress — there is only ever one.
+        guard let running = running, requested == nil || requested == running else {
+            stateLock.unlock()
+            call.resolve(["cancelled": false])
+            return
+        }
+        isCancelled = true
+        let reader = currentReader
+        stateLock.unlock()
+
+        reader?.cancelReading()
+        call.resolve(["cancelled": true])
+    }
 
     @objc func compressVideo(_ call: CAPPluginCall) {
         guard let sourcePath = call.getString("sourcePath") else {
             call.reject("Missing sourcePath")
             return
         }
-        
+
+        stateLock.lock()
+        currentJobId = call.getString("jobId") ?? "default"
+        isCancelled = false
+        stateLock.unlock()
+
         let videoURL = sourcePath.hasPrefix("file://") ? URL(string: sourcePath)! : URL(fileURLWithPath: sourcePath)
         let outputURL = FileManager.default.temporaryDirectory.appendingPathComponent("compressed_\(UUID().uuidString).mp4")
         
@@ -83,6 +135,7 @@ public class NativeVideoCompressorPlugin: CAPPlugin, CAPBridgedPlugin {
         backgroundTask: UIBackgroundTaskIdentifier
     ) {
         guard let videoTrack = asset.tracks(withMediaType: .video).first else {
+            clearJobState()
             call.reject("Không tìm thấy track video")
             return
         }
@@ -92,6 +145,18 @@ public class NativeVideoCompressorPlugin: CAPPlugin, CAPBridgedPlugin {
             let reader = try AVAssetReader(asset: asset)
             let writer = try AVAssetWriter(url: outputURL, fileType: .mp4)
             writer.shouldOptimizeForNetworkUse = true // Tối ưu cho Web/Network
+
+            stateLock.lock()
+            currentReader = reader
+            // A cancel that landed between compressVideo and here has nothing
+            // to call cancelReading() on, so honour it before any work starts.
+            let cancelledEarly = isCancelled
+            stateLock.unlock()
+
+            if cancelledEarly {
+                finishCancelled(outputURL: outputURL, call: call, backgroundTask: backgroundTask)
+                return
+            }
             
             // --- XỬ LÝ KÍCH THƯỚC VÀ CHIỀU XOAY (ORIENTATION) ---
             let naturalSize = videoTrack.naturalSize
@@ -216,7 +281,21 @@ public class NativeVideoCompressorPlugin: CAPPlugin, CAPBridgedPlugin {
                 if backgroundTask != .invalid {
                     UIApplication.shared.endBackgroundTask(backgroundTask)
                 }
-                
+
+                self.stateLock.lock()
+                let wasCancelled = self.isCancelled
+                self.currentReader = nil
+                self.currentJobId = nil
+                self.isCancelled = false
+                self.stateLock.unlock()
+
+                if wasCancelled {
+                    writer.cancelWriting()
+                    try? FileManager.default.removeItem(at: outputURL)
+                    call.reject("Đã hủy nén", NativeVideoCompressorPlugin.cancelledCode)
+                    return
+                }
+
                 if reader.status == .completed {
                     writer.finishWriting {
                         DispatchQueue.main.async {
@@ -232,12 +311,41 @@ public class NativeVideoCompressorPlugin: CAPPlugin, CAPBridgedPlugin {
                     }
                 } else {
                     writer.cancelWriting()
+                    try? FileManager.default.removeItem(at: outputURL)
                     call.reject("Lỗi khi đọc file: \(reader.error?.localizedDescription ?? "Unknown")")
                 }
             }
-            
+
         } catch {
+            clearJobState()
             call.reject("Lỗi khởi tạo bộ nén: \(error.localizedDescription)")
         }
     }
+
+    /// Cancelled before the reader started — nothing to stop, just clean up.
+    private func finishCancelled(
+        outputURL: URL,
+        call: CAPPluginCall,
+        backgroundTask: UIBackgroundTaskIdentifier
+    ) {
+        isCompressing = false
+        if backgroundTask != .invalid {
+            UIApplication.shared.endBackgroundTask(backgroundTask)
+        }
+        clearJobState()
+        try? FileManager.default.removeItem(at: outputURL)
+        call.reject("Đã hủy nén", NativeVideoCompressorPlugin.cancelledCode)
+    }
+
+    private func clearJobState() {
+        stateLock.lock()
+        currentReader = nil
+        currentJobId = nil
+        isCancelled = false
+        stateLock.unlock()
+    }
+
+    /// Matches the `CANCELLED` constant the JS side exports, so one
+    /// `error.code` check covers web, iOS and Android alike.
+    private static let cancelledCode = "CANCELLED"
 }

@@ -22,6 +22,54 @@ import java.util.Collections;
 @CapacitorPlugin(name = "NativeVideoCompressor")
 public class NativeVideoCompressorPlugin extends Plugin {
 
+    /**
+     * Matches the `CANCELLED` constant the JS side exports, so one
+     * `error.code` check covers web, iOS and Android alike.
+     */
+    private static final String CANCELLED_CODE = "CANCELLED";
+
+    private static final String STORAGE_SUBFOLDER = "compressed_videos";
+
+    /** The job compressVideo is running right now, for cancel({ jobId }). */
+    private String currentJobId = null;
+
+    /**
+     * Nothing to do natively; LightCompressor needs no warm-up. Answered
+     * rather than left unimplemented so a caller can await it unconditionally
+     * (the web build does need it, and shares the call site).
+     */
+    @PluginMethod
+    public void initialize(PluginCall call) {
+        JSObject ret = new JSObject();
+        ret.put("success", true);
+        ret.put("message", "No initialization needed on Android");
+        call.resolve(ret);
+    }
+
+    /**
+     * Stop the running compress. LightCompressor cancels its coroutine job and
+     * fires onCancelled, which is already wired below.
+     */
+    @PluginMethod
+    public void cancel(PluginCall call) {
+        String requested = call.getString("jobId");
+        JSObject ret = new JSObject();
+
+        synchronized (this) {
+            // VideoCompressor.cancel() is global — without the jobId check a
+            // cancel from one caller would kill whatever another had running.
+            if (currentJobId == null || (requested != null && !requested.equals(currentJobId))) {
+                ret.put("cancelled", false);
+                call.resolve(ret);
+                return;
+            }
+        }
+
+        VideoCompressor.cancel();
+        ret.put("cancelled", true);
+        call.resolve(ret);
+    }
+
     @PluginMethod
     public void compressVideo(PluginCall call) {
         String sourcePath = call.getString("sourcePath");
@@ -29,6 +77,11 @@ public class NativeVideoCompressorPlugin extends Plugin {
         if (sourcePath == null) {
             call.reject("Missing sourcePath");
             return;
+        }
+
+        String jobId = call.getString("jobId", "default");
+        synchronized (this) {
+            currentJobId = jobId;
         }
 
         // 1. Chuẩn bị Uri và Tên file xuất ra
@@ -80,7 +133,7 @@ public class NativeVideoCompressorPlugin extends Plugin {
         );
 
         // 3. Cấu hình nơi lưu (Lưu an toàn vào thư mục nội bộ của App)
-        AppSpecificStorageConfiguration storageConfig = new AppSpecificStorageConfiguration("compressed_videos");
+        AppSpecificStorageConfiguration storageConfig = new AppSpecificStorageConfiguration(STORAGE_SUBFOLDER);
 
         // Khởi động Foreground Service để giữ app luôn sống khi chạy ngầm
         Intent serviceIntent = new Intent(getContext(), VideoCompressionService.class);
@@ -114,13 +167,13 @@ public class NativeVideoCompressorPlugin extends Plugin {
 
                 @Override
                 public void onFailure(int i, @NonNull String failureMessage) {
-                    getContext().stopService(serviceIntent);
+                    finishJob(serviceIntent);
                     call.reject("Nén thất bại: " + failureMessage);
                 }
 
                 @Override
                 public void onSuccess(int i, long l, @Nullable String s) {
-                    getContext().stopService(serviceIntent);
+                    finishJob(serviceIntent);
                     // Nén xong, trả kết quả đường dẫn file mới về cho JS
                     JSObject ret = new JSObject();
                     ret.put("success", true);
@@ -137,10 +190,37 @@ public class NativeVideoCompressorPlugin extends Plugin {
 
                 @Override
                 public void onCancelled(int i) {
-                    getContext().stopService(serviceIntent);
-                    call.reject("Đã hủy nén");
+                    finishJob(serviceIntent);
+                    // LightCompressor leaves whatever it had already written
+                    // behind; without this the cache keeps a partial mp4 per
+                    // cancel, and nothing ever collects them.
+                    deleteOutput(fileName);
+                    // Coded so the caller can tell "the user asked for this"
+                    // apart from a real failure — same code on every platform.
+                    call.reject("Đã hủy nén", CANCELLED_CODE);
                 }
             }
         );
+    }
+
+    /** Every terminal callback ends here, so neither is ever left running. */
+    private void finishJob(Intent serviceIntent) {
+        getContext().stopService(serviceIntent);
+        synchronized (this) {
+            currentJobId = null;
+        }
+    }
+
+    /** Best-effort: a partial file left in the cache is not worth failing over. */
+    private void deleteOutput(String fileName) {
+        try {
+            File dir = new File(getContext().getExternalFilesDir(null), STORAGE_SUBFOLDER);
+            File partial = new File(dir, fileName);
+            if (partial.exists()) {
+                partial.delete();
+            }
+        } catch (Exception e) {
+            Log.w("NativeVideoCompressor", "Could not delete cancelled output", e);
+        }
     }
 }
