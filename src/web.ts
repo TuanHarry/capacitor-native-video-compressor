@@ -63,30 +63,45 @@ export class NativeVideoCompressorWeb extends WebPlugin implements NativeVideoCo
 
     this.notifyListeners('onProgress', { status: 'loading_core', percent: 0 });
 
+    // Built on a local, published to the field only once it is ready and still
+    // wanted. Assigning `this.ffmpeg` up front and setting `isLoaded` after the
+    // await left a window where a cancel could null the instance and the load,
+    // finishing a moment later, would set `isLoaded = true` on nothing at all —
+    // after which every compressVideo threw 'FFmpeg failed to load' for the
+    // rest of the page's life.
+    const instance = new FFmpeg();
+
+    // Listen to FFmpeg progress and map it to capacitor plugin events
+    instance.on('progress', ({ progress }) => {
+      // progress is a fraction between 0 and 1
+      this.notifyListeners('onProgress', { status: 'progress', percent: Math.round(progress * 100) });
+    });
+
+    instance.on('log', ({ message }) => {
+      console.log('[FFmpeg Log]', message);
+    });
+
     try {
-      this.ffmpeg = new FFmpeg();
-
-      // Listen to FFmpeg progress and map it to capacitor plugin events
-      this.ffmpeg.on('progress', ({ progress }) => {
-        // progress is a fraction between 0 and 1
-        this.notifyListeners('onProgress', { status: 'progress', percent: Math.round(progress * 100) });
-      });
-
-      this.ffmpeg.on('log', ({ message }) => {
-        console.log('[FFmpeg Log]', message);
-      });
-
       // Use standard single-threaded version for best compatibility across browsers
       // without requiring complex SharedArrayBuffer headers configuration
       console.log('Starting to load FFmpeg core from:', CORE_BASE_URL);
-      await this.ffmpeg.load(await loadCoreURLs());
-
-      this.isLoaded = true;
-      console.log('FFmpeg core loaded successfully');
+      await instance.load(await loadCoreURLs());
     } catch (e: any) {
+      instance.terminate();
       console.error('Failed to load FFmpeg:', e);
       throw e;
     }
+
+    // Cancelled while this was loading. Terminate what we just built rather
+    // than publish it — the caller asked for none of it.
+    if (this.cancelRequested) {
+      instance.terminate();
+      throw new CancelledError();
+    }
+
+    this.ffmpeg = instance;
+    this.isLoaded = true;
+    console.log('FFmpeg core loaded successfully');
   }
 
   /**
@@ -104,6 +119,8 @@ export class NativeVideoCompressorWeb extends WebPlugin implements NativeVideoCo
     if (!this.currentJobId) return { cancelled: false };
     if (options?.jobId && options.jobId !== this.currentJobId) return { cancelled: false };
 
+    // Set even when there is no instance yet: the job may still be inside
+    // loadFFmpeg, which reads this flag before publishing what it built.
     this.cancelRequested = true;
     this.ffmpeg?.terminate();
     this.ffmpeg = null;
@@ -144,6 +161,11 @@ export class NativeVideoCompressorWeb extends WebPlugin implements NativeVideoCo
       if (!this.ffmpeg) {
         throw new Error('FFmpeg failed to load');
       }
+      // Bound once. `this.ffmpeg` is nulled by cancel(), so reading it after
+      // any of the four awaits below can hand back null on a reference the
+      // compiler narrowed at this line — surfacing a cancel as a TypeError
+      // instead of a CancelledError.
+      const ffmpeg = this.ffmpeg;
 
       this.notifyListeners('onProgress', { status: 'started', percent: 0 });
 
@@ -201,7 +223,7 @@ export class NativeVideoCompressorWeb extends WebPlugin implements NativeVideoCo
 
       console.log('[FFmpeg] Writing file to FS...', inputData.byteLength, 'bytes');
       try {
-        await this.ffmpeg.writeFile(inputFileName, inputData);
+        await ffmpeg.writeFile(inputFileName, inputData);
       } catch (err) {
         if (this.cancelRequested) throw new CancelledError();
         console.error('[FFmpeg] Error writing to FS:', err);
@@ -228,7 +250,7 @@ export class NativeVideoCompressorWeb extends WebPlugin implements NativeVideoCo
 
       console.log('[FFmpeg] Executing command:', args.join(' '));
       try {
-        const retCode = await this.ffmpeg.exec(args);
+        const retCode = await ffmpeg.exec(args);
         console.log('[FFmpeg] Exec returned code:', retCode);
       } catch (err) {
         // terminate() rejects every in-flight call, so a cancel arrives here
@@ -242,7 +264,7 @@ export class NativeVideoCompressorWeb extends WebPlugin implements NativeVideoCo
       console.log('[FFmpeg] Reading output file...');
       let data: any;
       try {
-        data = await this.ffmpeg.readFile(outputFileName);
+        data = await ffmpeg.readFile(outputFileName);
       } catch (err) {
         if (this.cancelRequested) throw new CancelledError();
         console.error('[FFmpeg] Error reading output file:', err);
@@ -250,8 +272,8 @@ export class NativeVideoCompressorWeb extends WebPlugin implements NativeVideoCo
       }
 
       // Free memory
-      await this.ffmpeg.deleteFile(inputFileName);
-      await this.ffmpeg.deleteFile(outputFileName);
+      await ffmpeg.deleteFile(inputFileName);
+      await ffmpeg.deleteFile(outputFileName);
 
       console.log('[FFmpeg] Creating Blob URL from output...', data.byteLength, 'bytes');
       // Create a blob URL for the resulting file

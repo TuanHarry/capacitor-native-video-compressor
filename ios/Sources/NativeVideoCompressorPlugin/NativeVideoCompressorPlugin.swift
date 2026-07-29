@@ -18,7 +18,6 @@ public class NativeVideoCompressorPlugin: CAPPlugin, CAPBridgedPlugin {
         CAPPluginMethod(name: "initialize", returnType: CAPPluginReturnPromise)
     ]
 
-    private var isCompressing = false
     /// The job `compressVideo` is running right now, for `cancel(jobId:)`.
     private var currentJobId: String?
     private var isCancelled = false
@@ -104,7 +103,6 @@ public class NativeVideoCompressorPlugin: CAPPlugin, CAPBridgedPlugin {
         let asset = AVAsset(url: videoURL)
         
         self.notifyListeners("onProgress", data:["status": "started"])
-        self.isCompressing = true
         
         var backgroundTask: UIBackgroundTaskIdentifier = .invalid
         backgroundTask = UIApplication.shared.beginBackgroundTask(withName: "VideoCompression") {
@@ -277,7 +275,6 @@ public class NativeVideoCompressorPlugin: CAPPlugin, CAPBridgedPlugin {
             
             // --- KẾT THÚC ---
             group.notify(queue: .main) {
-                self.isCompressing = false
                 if backgroundTask != .invalid {
                     UIApplication.shared.endBackgroundTask(backgroundTask)
                 }
@@ -328,7 +325,6 @@ public class NativeVideoCompressorPlugin: CAPPlugin, CAPBridgedPlugin {
         call: CAPPluginCall,
         backgroundTask: UIBackgroundTaskIdentifier
     ) {
-        isCompressing = false
         if backgroundTask != .invalid {
             UIApplication.shared.endBackgroundTask(backgroundTask)
         }

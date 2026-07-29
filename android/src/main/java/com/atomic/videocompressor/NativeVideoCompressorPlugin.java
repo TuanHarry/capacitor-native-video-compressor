@@ -54,19 +54,22 @@ public class NativeVideoCompressorPlugin extends Plugin {
     public void cancel(PluginCall call) {
         String requested = call.getString("jobId");
         JSObject ret = new JSObject();
+        boolean cancelled;
 
+        // The cancel call itself must be INSIDE the lock. Released first, the
+        // running job could finish and a new one start in the gap — and
+        // VideoCompressor.cancel() being global, it would kill the newcomer.
+        // That is exactly what checking the jobId is meant to prevent.
+        // The call is non-blocking (it cancels a coroutine job), so holding
+        // the lock across it costs nothing.
         synchronized (this) {
-            // VideoCompressor.cancel() is global — without the jobId check a
-            // cancel from one caller would kill whatever another had running.
-            if (currentJobId == null || (requested != null && !requested.equals(currentJobId))) {
-                ret.put("cancelled", false);
-                call.resolve(ret);
-                return;
+            cancelled = currentJobId != null && (requested == null || requested.equals(currentJobId));
+            if (cancelled) {
+                VideoCompressor.cancel();
             }
         }
 
-        VideoCompressor.cancel();
-        ret.put("cancelled", true);
+        ret.put("cancelled", cancelled);
         call.resolve(ret);
     }
 
