@@ -30,8 +30,10 @@ public class VideoCompressionService extends Service {
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .build();
 
-        // Android 15+ (API 35) requires a valid foreground service type for transcoding work.
-        // We rely on the manifest declaration for mediaProcessing.
+        // The foreground service type comes from AndroidManifest.xml: mediaProcessing.
+        // NOTE: that type and its permission only exist from API 35 (Android 15). On API 34
+        // startForeground() may fail, and the catch below would hide it - leaving a service
+        // that never enters the foreground. Verify on an Android 14 device before release.
         try {
             startForeground(NOTIFICATION_ID, notification);
         } catch (Exception e) {
