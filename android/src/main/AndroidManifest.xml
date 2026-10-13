@@ -1,11 +1,14 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- mediaProcessing chỉ tồn tại từ API 35. Khai kèm dataSync để máy API 34
+         trở xuống vẫn có một type hợp lệ - service chọn type theo SDK_INT lúc chạy. -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROCESSING" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
 
     <application>
         <service
             android:name="com.atomic.videocompressor.VideoCompressionService"
-            android:foregroundServiceType="mediaProcessing"
+            android:foregroundServiceType="mediaProcessing|dataSync"
             android:exported="false" />
     </application>
 </manifest>

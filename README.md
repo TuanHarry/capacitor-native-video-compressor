@@ -54,9 +54,16 @@ allprojects {
 
 #### compileSdk 35+ (required)
 
-The compression foreground service is declared as
-`android:foregroundServiceType="mediaProcessing"`, which exists from **API 35 (Android 15)**.
-Your app must build with `compileSdkVersion` 35 or higher.
+The compression foreground service declares `android:foregroundServiceType="mediaProcessing|dataSync"`.
+`mediaProcessing` exists only from **API 35 (Android 15)**, so your app must build with
+`compileSdkVersion` 35 or higher.
+
+At runtime the service picks the type by API level: `mediaProcessing` on API 35+,
+`dataSync` on API 29-34. Both types and both permissions are declared, so the plugin
+runs correctly on Android 10 through 15+. Passing only `mediaProcessing` on API 34
+makes the system read the type as unknown and `startForeground()` throws
+`InvalidForegroundServiceTypeException` - the service never reaches the foreground
+and compression is killed as soon as the user leaves the app.
 
 ## Web Configuration (Required)
 
