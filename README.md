@@ -35,6 +35,36 @@ If you are reading videos from external storage, ensure you have the appropriate
 <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
 ```
 
+#### JitPack repository (required)
+
+The Android implementation depends on `LightCompressor`, which is published on JitPack.
+A plugin's own `repositories` block does not propagate to the consuming app, so you must
+add JitPack to your app's `android/build.gradle` — otherwise the build fails with
+`Could not find com.github.AbedElazizShe:LightCompressor`:
+
+```gradle
+allprojects {
+    repositories {
+        google()
+        mavenCentral()
+        maven { url 'https://jitpack.io' }
+    }
+}
+```
+
+#### compileSdk 35+ (required)
+
+The compression foreground service declares `android:foregroundServiceType="mediaProcessing|dataSync"`.
+`mediaProcessing` exists only from **API 35 (Android 15)**, so your app must build with
+`compileSdkVersion` 35 or higher.
+
+At runtime the service picks the type by API level: `mediaProcessing` on API 35+,
+`dataSync` on API 29-34. Both types and both permissions are declared, so the plugin
+runs correctly on Android 10 through 15+. Passing only `mediaProcessing` on API 34
+makes the system read the type as unknown and `startForeground()` throws
+`InvalidForegroundServiceTypeException` - the service never reaches the foreground
+and compression is killed as soon as the user leaves the app.
+
 ## Web Configuration (Required)
 
 To use video compression on the Web platform, `FFmpeg.wasm` requires `SharedArrayBuffer` to function properly. You must configure your web server/framework to serve these specific HTTP headers:
