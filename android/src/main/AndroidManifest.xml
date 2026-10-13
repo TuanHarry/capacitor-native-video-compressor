@@ -1,11 +1,11 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROCESSING" />
 
     <application>
         <service
             android:name="com.atomic.videocompressor.VideoCompressionService"
-            android:foregroundServiceType="dataSync"
+            android:foregroundServiceType="mediaProcessing"
             android:exported="false" />
     </application>
 </manifest>

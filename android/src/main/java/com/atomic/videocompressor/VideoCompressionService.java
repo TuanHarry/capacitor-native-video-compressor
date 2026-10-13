@@ -30,8 +30,8 @@ public class VideoCompressionService extends Service {
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .build();
 
-        // Check for Android 14+ specific foreground service typing requirements if compiled against API 34+
-        // In this case, we rely on the manifest declaration for dataSync.
+        // Android 15+ (API 35) requires a valid foreground service type for transcoding work.
+        // We rely on the manifest declaration for mediaProcessing.
         try {
             startForeground(NOTIFICATION_ID, notification);
         } catch (Exception e) {
