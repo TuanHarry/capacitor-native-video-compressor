@@ -140,15 +140,7 @@ public class NativeVideoCompressorPlugin extends Plugin {
 
         // Khởi động Foreground Service để giữ app luôn sống khi chạy ngầm
         Intent serviceIntent = new Intent(getContext(), VideoCompressionService.class);
-        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
-            try {
-                getContext().startForegroundService(serviceIntent);
-            } catch (Exception e) {
-                getContext().startService(serviceIntent);
-            }
-        } else {
-            getContext().startService(serviceIntent);
-        }
+        startServiceCompat(serviceIntent);
 
         // 4. Bắt đầu nén (Đã cập nhật List Uri và int index)
         VideoCompressor.start(
@@ -206,11 +198,49 @@ public class NativeVideoCompressorPlugin extends Plugin {
         );
     }
 
-    /** Every terminal callback ends here, so neither is ever left running. */
+    /**
+     * Every terminal callback ends here, so neither is ever left running.
+     *
+     * Dừng bằng một command gửi vào service chứ không phải stopService(): hai lệnh
+     * start/stop đi qua ActivityManager không bảo đảm thứ tự, nên một lần nén lỗi
+     * trong ~90ms (video hỏng) sẽ dừng service trước khi nó kịp startForeground()
+     * và Android giết cả app bằng ForegroundServiceDidNotStartInTimeException.
+     * Command thì dispatch tuần tự trên main thread của service nên luôn đúng thứ tự.
+     */
     private void finishJob(Intent serviceIntent) {
-        getContext().stopService(serviceIntent);
+        Intent stopIntent = new Intent(getContext(), VideoCompressionService.class);
+        stopIntent.setAction(VideoCompressionService.ACTION_STOP);
+        if (!startServiceCompat(stopIntent)) {
+            // Không gửi được command (hệ thống chặn start) thì service cũng không
+            // còn sống để mà treo - dọn bằng cách cũ cho chắc.
+            try {
+                getContext().stopService(serviceIntent);
+            } catch (Exception e) {
+                Log.w("NativeVideoCompressor", "Could not stop compression service", e);
+            }
+        }
         synchronized (this) {
             currentJobId = null;
+        }
+    }
+
+    /** @return false khi hệ thống từ chối cả hai cách khởi động service. */
+    private boolean startServiceCompat(Intent intent) {
+        try {
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                getContext().startForegroundService(intent);
+            } else {
+                getContext().startService(intent);
+            }
+            return true;
+        } catch (Exception e) {
+            try {
+                getContext().startService(intent);
+                return true;
+            } catch (Exception inner) {
+                Log.w("NativeVideoCompressor", "Could not start compression service", inner);
+                return false;
+            }
         }
     }
 
