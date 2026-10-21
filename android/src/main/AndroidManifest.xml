@@ -1,12 +1,17 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- Chỉ dataSync, không khai mediaProcessing.
+         Hai type nghĩa là hai quyền phải biện minh riêng trong Play Console với
+         cùng một video demo, và mediaProcessing khó thuyết phục hơn hẳn. dataSync
+         phủ được cả hai pha: nén rồi tải lên là một thao tác đồng bộ dữ liệu liên
+         tục do user khởi tạo - đúng ví dụ "upload photo to the cloud" mà policy nêu. -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROCESSING" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <application>
         <service
             android:name="com.atomic.videocompressor.VideoCompressionService"
-            android:foregroundServiceType="mediaProcessing|dataSync"
+            android:foregroundServiceType="dataSync"
             android:exported="false" />
     </application>
 </manifest>

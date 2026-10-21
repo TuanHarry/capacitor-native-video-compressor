@@ -16,6 +16,7 @@ import com.getcapacitor.PluginCall;
 import com.getcapacitor.PluginMethod;
 import com.getcapacitor.annotation.CapacitorPlugin;
 import java.io.File;
+import java.lang.ref.WeakReference;
 import java.util.Arrays;
 import java.util.Collections;
 
@@ -29,12 +30,52 @@ public class NativeVideoCompressorPlugin extends Plugin {
     private static final String CANCELLED_CODE = "CANCELLED";
 
     private static final String STORAGE_SUBFOLDER = "compressed_videos";
-    private static final String ACTION_START = "com.atomic.videocompressor.START";
-    private static final String ACTION_UPLOAD = "com.atomic.videocompressor.UPLOAD";
-    private static final String ACTION_FINISH = "com.atomic.videocompressor.FINISH";
+
+    /**
+     * Instance đang sống, để service gọi ngược khi user bấm "Huỷ" trên
+     * notification. WeakReference vì service sống lâu hơn bridge: giữ cứng ở
+     * đây là giữ luôn cả WebView sau khi Activity đã chết.
+     */
+    private static WeakReference<NativeVideoCompressorPlugin> active = new WeakReference<>(null);
 
     /** The job compressVideo is running right now, for cancel({ jobId }). */
     private String currentJobId = null;
+
+    @Override
+    public void load() {
+        super.load();
+        active = new WeakReference<>(this);
+    }
+
+    @Override
+    protected void handleOnDestroy() {
+        if (active.get() == this) active = new WeakReference<>(null);
+        super.handleOnDestroy();
+    }
+
+    /**
+     * User bấm "Huỷ" trên notification. Phải huỷ được cả hai pha:
+     *
+     *  - pha nén chạy trong LightCompressor (native) -> cancel() tĩnh, gọi được
+     *    kể cả khi bridge đã chết
+     *  - pha upload chạy trong JS -> chỉ có thể nhờ JS tự dừng, nên bắn
+     *    onCancelRequested; không có event này thì bấm Huỷ lúc đang upload chỉ
+     *    tắt được notification còn request vẫn chạy tiếp, và Play coi như
+     *    "không dừng được bởi user".
+     */
+    static void cancelAllFromNotification() {
+        try {
+            VideoCompressor.cancel();
+        } catch (Exception e) {
+            Log.w("NativeVideoCompressor", "Could not cancel compression", e);
+        }
+        NativeVideoCompressorPlugin plugin = active.get();
+        if (plugin == null) return;
+        synchronized (plugin) {
+            plugin.currentJobId = null;
+        }
+        plugin.notifyListeners("onCancelRequested", new JSObject());
+    }
 
     /**
      * Nothing to do natively; LightCompressor needs no warm-up. Answered
@@ -80,10 +121,7 @@ public class NativeVideoCompressorPlugin extends Plugin {
     public void finishUpload(PluginCall call) {
         String jobId = call.getString("jobId");
         if (jobId != null) {
-            Intent intent = new Intent(getContext(), VideoCompressionService.class);
-            intent.setAction(ACTION_FINISH);
-            intent.putExtra("jobId", jobId);
-            getContext().startService(intent);
+            sendToService(VideoCompressionService.ACTION_FINISH, jobId);
         }
         call.resolve();
     }
@@ -156,18 +194,18 @@ public class NativeVideoCompressorPlugin extends Plugin {
 
         // Khởi động Foreground Service để giữ app luôn sống khi chạy ngầm
         Intent serviceIntent = new Intent(getContext(), VideoCompressionService.class);
-        serviceIntent.setAction(ACTION_START);
-        serviceIntent.putExtra("jobId", jobId);
-        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
-            try {
+        serviceIntent.setAction(VideoCompressionService.ACTION_START);
+        serviceIntent.putExtra(VideoCompressionService.EXTRA_JOB_ID, jobId);
+        try {
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
                 getContext().startForegroundService(serviceIntent);
-            } catch (Exception e) {
-                synchronized (this) { currentJobId = null; }
-                call.reject("Cannot start foreground video processing", e);
-                return;
+            } else {
+                getContext().startService(serviceIntent);
             }
-        } else {
-            getContext().startService(serviceIntent);
+        } catch (Exception e) {
+            synchronized (this) { currentJobId = null; }
+            call.reject("Cannot start foreground video processing", e);
+            return;
         }
 
         // 4. Bắt đầu nén (Đã cập nhật List Uri và int index)
@@ -181,6 +219,11 @@ public class NativeVideoCompressorPlugin extends Plugin {
             new CompressionListener() {
                 @Override
                 public void onProgress(int i, float v) {
+                    // Notification phải nhúc nhích theo đúng con số mà UI trong
+                    // app đang hiển thị: một notification đứng im là lý do Play
+                    // đánh trượt tiêu chí "user perceptible".
+                    VideoCompressionService.publishProgress(jobId, Math.round(v));
+
                     // Gửi % tiến độ về Javascript để vẽ thanh Progress
                     JSObject ret = new JSObject();
                     ret.put("status", "progress");
@@ -228,12 +271,31 @@ public class NativeVideoCompressorPlugin extends Plugin {
 
     /** Every terminal callback ends here, so neither is ever left running. */
     private void finishJob(String jobId, boolean holdForUpload) {
-        Intent intent = new Intent(getContext(), VideoCompressionService.class);
-        intent.setAction(holdForUpload ? ACTION_UPLOAD : ACTION_FINISH);
-        intent.putExtra("jobId", jobId);
-        getContext().startService(intent);
+        sendToService(
+            holdForUpload ? VideoCompressionService.ACTION_UPLOAD : VideoCompressionService.ACTION_FINISH,
+            jobId
+        );
         synchronized (this) {
             currentJobId = null;
+        }
+    }
+
+    /**
+     * Lệnh gửi vào service, nuốt lỗi có chủ đích.
+     *
+     * startService() từ background bị chặn khi app không còn foreground service
+     * nào chạy - đúng tình huống xảy ra khi service đã tự tắt bằng watchdog rồi
+     * JS mới gọi finishUpload. Ném ra ở đây sẽ biến một lần dọn dẹp vô hại thành
+     * một lần nén báo lỗi cho user.
+     */
+    private void sendToService(String action, String jobId) {
+        try {
+            Intent intent = new Intent(getContext(), VideoCompressionService.class);
+            intent.setAction(action);
+            intent.putExtra(VideoCompressionService.EXTRA_JOB_ID, jobId);
+            getContext().startService(intent);
+        } catch (Exception e) {
+            Log.w("NativeVideoCompressor", "Could not send " + action + " to service", e);
         }
     }
 
