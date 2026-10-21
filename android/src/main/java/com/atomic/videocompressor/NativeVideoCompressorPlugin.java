@@ -29,6 +29,9 @@ public class NativeVideoCompressorPlugin extends Plugin {
     private static final String CANCELLED_CODE = "CANCELLED";
 
     private static final String STORAGE_SUBFOLDER = "compressed_videos";
+    private static final String ACTION_START = "com.atomic.videocompressor.START";
+    private static final String ACTION_UPLOAD = "com.atomic.videocompressor.UPLOAD";
+    private static final String ACTION_FINISH = "com.atomic.videocompressor.FINISH";
 
     /** The job compressVideo is running right now, for cancel({ jobId }). */
     private String currentJobId = null;
@@ -74,6 +77,18 @@ public class NativeVideoCompressorPlugin extends Plugin {
     }
 
     @PluginMethod
+    public void finishUpload(PluginCall call) {
+        String jobId = call.getString("jobId");
+        if (jobId != null) {
+            Intent intent = new Intent(getContext(), VideoCompressionService.class);
+            intent.setAction(ACTION_FINISH);
+            intent.putExtra("jobId", jobId);
+            getContext().startService(intent);
+        }
+        call.resolve();
+    }
+
+    @PluginMethod
     public void compressVideo(PluginCall call) {
         String sourcePath = call.getString("sourcePath");
 
@@ -83,6 +98,7 @@ public class NativeVideoCompressorPlugin extends Plugin {
         }
 
         String jobId = call.getString("jobId", "default");
+        boolean holdForUpload = Boolean.TRUE.equals(call.getBoolean("holdForUpload", false));
         synchronized (this) {
             currentJobId = jobId;
         }
@@ -140,7 +156,19 @@ public class NativeVideoCompressorPlugin extends Plugin {
 
         // Khởi động Foreground Service để giữ app luôn sống khi chạy ngầm
         Intent serviceIntent = new Intent(getContext(), VideoCompressionService.class);
-        startServiceCompat(serviceIntent);
+        serviceIntent.setAction(ACTION_START);
+        serviceIntent.putExtra("jobId", jobId);
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+            try {
+                getContext().startForegroundService(serviceIntent);
+            } catch (Exception e) {
+                synchronized (this) { currentJobId = null; }
+                call.reject("Cannot start foreground video processing", e);
+                return;
+            }
+        } else {
+            getContext().startService(serviceIntent);
+        }
 
         // 4. Bắt đầu nén (Đã cập nhật List Uri và int index)
         VideoCompressor.start(
@@ -162,13 +190,13 @@ public class NativeVideoCompressorPlugin extends Plugin {
 
                 @Override
                 public void onFailure(int i, @NonNull String failureMessage) {
-                    finishJob(serviceIntent);
+                    finishJob(jobId, false);
                     call.reject("Nén thất bại: " + failureMessage);
                 }
 
                 @Override
                 public void onSuccess(int i, long l, @Nullable String s) {
-                    finishJob(serviceIntent);
+                    finishJob(jobId, holdForUpload);
                     // Nén xong, trả kết quả đường dẫn file mới về cho JS
                     JSObject ret = new JSObject();
                     ret.put("success", true);
@@ -185,7 +213,7 @@ public class NativeVideoCompressorPlugin extends Plugin {
 
                 @Override
                 public void onCancelled(int i) {
-                    finishJob(serviceIntent);
+                    finishJob(jobId, false);
                     // LightCompressor leaves whatever it had already written
                     // behind; without this the cache keeps a partial mp4 per
                     // cancel, and nothing ever collects them.
@@ -198,49 +226,14 @@ public class NativeVideoCompressorPlugin extends Plugin {
         );
     }
 
-    /**
-     * Every terminal callback ends here, so neither is ever left running.
-     *
-     * Dừng bằng một command gửi vào service chứ không phải stopService(): hai lệnh
-     * start/stop đi qua ActivityManager không bảo đảm thứ tự, nên một lần nén lỗi
-     * trong ~90ms (video hỏng) sẽ dừng service trước khi nó kịp startForeground()
-     * và Android giết cả app bằng ForegroundServiceDidNotStartInTimeException.
-     * Command thì dispatch tuần tự trên main thread của service nên luôn đúng thứ tự.
-     */
-    private void finishJob(Intent serviceIntent) {
-        Intent stopIntent = new Intent(getContext(), VideoCompressionService.class);
-        stopIntent.setAction(VideoCompressionService.ACTION_STOP);
-        if (!startServiceCompat(stopIntent)) {
-            // Không gửi được command (hệ thống chặn start) thì service cũng không
-            // còn sống để mà treo - dọn bằng cách cũ cho chắc.
-            try {
-                getContext().stopService(serviceIntent);
-            } catch (Exception e) {
-                Log.w("NativeVideoCompressor", "Could not stop compression service", e);
-            }
-        }
+    /** Every terminal callback ends here, so neither is ever left running. */
+    private void finishJob(String jobId, boolean holdForUpload) {
+        Intent intent = new Intent(getContext(), VideoCompressionService.class);
+        intent.setAction(holdForUpload ? ACTION_UPLOAD : ACTION_FINISH);
+        intent.putExtra("jobId", jobId);
+        getContext().startService(intent);
         synchronized (this) {
             currentJobId = null;
-        }
-    }
-
-    /** @return false khi hệ thống từ chối cả hai cách khởi động service. */
-    private boolean startServiceCompat(Intent intent) {
-        try {
-            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
-                getContext().startForegroundService(intent);
-            } else {
-                getContext().startService(intent);
-            }
-            return true;
-        } catch (Exception e) {
-            try {
-                getContext().startService(intent);
-                return true;
-            } catch (Exception inner) {
-                Log.w("NativeVideoCompressor", "Could not start compression service", inner);
-                return false;
-            }
         }
     }
 
