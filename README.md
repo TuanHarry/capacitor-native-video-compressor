@@ -226,7 +226,9 @@ The `quality` parameter determines the output resolution and compression ratio. 
 * [`compressVideo(...)`](#compressvideo)
 * [`cancel(...)`](#cancel)
 * [`initialize()`](#initialize)
+* [`finishUpload(...)`](#finishupload)
 * [`addListener('onProgress', ...)`](#addlisteneronprogress-)
+* [`addListener('onCancelRequested', ...)`](#addlisteneroncancelrequested-)
 * [Interfaces](#interfaces)
 
 </docgen-index>
@@ -282,6 +284,24 @@ initialize() => Promise<{ success: boolean; message?: string; }>
 --------------------
 
 
+### finishUpload(...)
+
+```typescript
+finishUpload(options: { jobId: string; }) => Promise<void>
+```
+
+Báo rằng phần upload đi kèm `holdForUpload` đã xong (thành công hay thất
+bại đều phải gọi) để Android hạ foreground service xuống.
+
+No-op trên web và iOS.
+
+| Param         | Type                            |
+| ------------- | ------------------------------- |
+| **`options`** | <code>{ jobId: string; }</code> |
+
+--------------------
+
+
 ### addListener('onProgress', ...)
 
 ```typescript
@@ -292,6 +312,29 @@ addListener(eventName: 'onProgress', listenerFunc: (info: { status: string; perc
 | ------------------ | --------------------------------------------------------------------- |
 | **`eventName`**    | <code>'onProgress'</code>                                             |
 | **`listenerFunc`** | <code>(info: { status: string; percent?: number; }) =&gt; void</code> |
+
+**Returns:** <code>Promise&lt;<a href="#pluginlistenerhandle">PluginListenerHandle</a>&gt;</code>
+
+--------------------
+
+
+### addListener('onCancelRequested', ...)
+
+```typescript
+addListener(eventName: 'onCancelRequested', listenerFunc: () => void) => Promise<PluginListenerHandle>
+```
+
+Android: user đã bấm "Huỷ" trên notification của foreground service.
+
+Pha nén được plugin tự huỷ trước khi event này bắn, nhưng pha upload chạy
+trong JS nên không ai dừng hộ được - caller phải tự abort request đang
+chạy. Bỏ qua event này nghĩa là nút Huỷ không thật sự huỷ, và Play đánh
+trượt tiêu chí "can be terminated or stopped by the user".
+
+| Param              | Type                             |
+| ------------------ | -------------------------------- |
+| **`eventName`**    | <code>'onCancelRequested'</code> |
+| **`listenerFunc`** | <code>() =&gt; void</code>       |
 
 **Returns:** <code>Promise&lt;<a href="#pluginlistenerhandle">PluginListenerHandle</a>&gt;</code>
 
@@ -311,12 +354,13 @@ addListener(eventName: 'onProgress', listenerFunc: (info: { status: string; perc
 
 #### CompressOptions
 
-| Prop             | Type                                                                            | Description                                                                                                                                                                                                                                                                                                                                              |
-| ---------------- | ------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **`sourcePath`** | <code>string</code>                                                             |                                                                                                                                                                                                                                                                                                                                                          |
-| **`destPath`**   | <code>string</code>                                                             |                                                                                                                                                                                                                                                                                                                                                          |
-| **`quality`**    | <code>'VERY_HIGH' \| 'HIGH' \| 'MEDIUM' \| 'LOW' \| 'VERY_LOW' \| '360P'</code> |                                                                                                                                                                                                                                                                                                                                                          |
-| **`jobId`**      | <code>string</code>                                                             | Names this compress so `cancel({ jobId })` can target it. Every platform compresses one video at a time, so cancellation is global by nature. Two independent callers in the same app (say a comment queue and a notes queue) therefore need a way to say *which* job they mean — without one, a cancel from either kills whatever the other is running. |
+| Prop                | Type                                                                            | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| ------------------- | ------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **`sourcePath`**    | <code>string</code>                                                             |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| **`destPath`**      | <code>string</code>                                                             |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| **`quality`**       | <code>'VERY_HIGH' \| 'HIGH' \| 'MEDIUM' \| 'LOW' \| 'VERY_LOW' \| '360P'</code> |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| **`jobId`**         | <code>string</code>                                                             | Names this compress so `cancel({ jobId })` can target it. Every platform compresses one video at a time, so cancellation is global by nature. Two independent callers in the same app (say a comment queue and a notes queue) therefore need a way to say *which* job they mean — without one, a cancel from either kills whatever the other is running.                                                                                                                           |
+| **`holdForUpload`** | <code>boolean</code>                                                            | Android: giữ foreground service sống sau khi nén xong, để phần upload do JS chạy tiếp theo không bị hệ thống giết khi user rời app. Bật cờ này là một lời hứa: caller PHẢI gọi {@link NativeVideoCompressorPlugin.finishUpload} khi upload kết thúc, kể cả ở nhánh lỗi. Không gọi thì service chỉ còn watchdog dọn hộ sau 15 phút, và trong 15 phút đó user nhìn thấy một notification nói rằng app đang làm việc trong khi nó không làm gì cả. Không có tác dụng trên web và iOS. |
 
 
 #### CancelResult
