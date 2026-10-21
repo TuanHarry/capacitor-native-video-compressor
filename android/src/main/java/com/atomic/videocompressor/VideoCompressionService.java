@@ -81,10 +81,16 @@ public class VideoCompressionService extends Service {
 
     /**
      * Instance đang sống, để plugin đẩy % vào mà không phải gửi một Intent cho
-     * mỗi tick. Chỉ đọc/ghi trên main thread nên không cần đồng bộ hoá.
+     * mỗi tick.
+     *
+     * volatile vì được đọc từ thread nền: LightCompressor gọi onProgress thẳng
+     * từ coroutine encoder (Dispatchers.Default), không hop về main - đã kiểm
+     * bằng bytecode, onProgressChanged gọi listener trực tiếp không qua
+     * withContext. Thiếu volatile thì thread đó có thể đọc phải một tham chiếu
+     * cũ của service đã destroy.
      */
     @Nullable
-    private static VideoCompressionService instance = null;
+    private static volatile VideoCompressionService instance = null;
 
     @Override
     public void onCreate() {
@@ -106,7 +112,7 @@ public class VideoCompressionService extends Service {
     }
 
     /**
-     * Cập nhật tiến độ nén. Gọi từ plugin trên main thread.
+     * Cập nhật tiến độ nén. Gọi được từ thread bất kỳ.
      *
      * No-op khi service chưa/không còn sống: progress là thông tin trang trí,
      * không đáng để dựng lại một foreground service đã tắt.
@@ -114,7 +120,10 @@ public class VideoCompressionService extends Service {
     static void publishProgress(String jobId, int percent) {
         VideoCompressionService service = instance;
         if (service == null) return;
-        service.applyProgress(jobId, percent);
+        // Chuyển về main thread: lời gọi tới đây nằm trên thread encoder của
+        // LightCompressor, còn jobs/handler/notification đều chỉ được chạm từ
+        // main. Không post thì LinkedHashMap bị sửa đồng thời với onStartCommand.
+        service.handler.post(() -> service.applyProgress(jobId, percent));
     }
 
     private void applyProgress(String jobId, int percent) {
