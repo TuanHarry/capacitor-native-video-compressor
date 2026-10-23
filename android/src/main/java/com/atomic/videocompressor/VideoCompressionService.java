@@ -99,7 +99,7 @@ public class VideoCompressionService extends Service {
         NotificationChannel channel = new NotificationChannel(
             CHANNEL_ID, "Xử lý và tải video lên", NotificationManager.IMPORTANCE_LOW
         );
-        channel.setDescription("Tiến trình nén và tải video lên khi bạn dùng ứng dụng khác");
+        channel.setDescription("Tiến trình nén và tải video lên");
         NotificationManager manager = getSystemService(NotificationManager.class);
         if (manager != null) manager.createNotificationChannel(channel);
     }
@@ -207,13 +207,22 @@ public class VideoCompressionService extends Service {
             title = shown.phase == Phase.UPLOADING ? "Đang tải video lên" : "Đang nén video";
         }
 
+        // Hai pha nói hai điều khác nhau, vì chúng chạy ở hai nơi khác nhau.
+        //
+        // Nén chạy ở native trong chính service này nên vẫn chạy khi app
+        // xuống nền. Upload thì chạy bằng JS trong webview, nên nó đứng lại
+        // và chỉ tiếp tục khi app trở lại foreground - đo được: nén xong là
+        // mọi hoạt động mạng dừng hẳn cho tới khi watchdog tự dừng service
+        // sau 15 phút. Vì vậy pha upload phải nói rõ việc người dùng cần làm.
         String text;
-        if (indeterminate) {
-            text = "Đang tải lên, sẽ tiếp tục khi bạn dùng ứng dụng khác";
+        if (shown.phase == Phase.UPLOADING) {
+            text = indeterminate
+                ? "Mở lại ứng dụng để hoàn tất tải lên"
+                : shown.percent + "% - mở lại ứng dụng để hoàn tất tải lên";
         } else {
-            text = shown.percent + "% - "
-                + (shown.phase == Phase.UPLOADING ? "đang tải lên" : "đang nén")
-                + ", sẽ tiếp tục khi bạn dùng ứng dụng khác";
+            text = indeterminate
+                ? "Đang nén video"
+                : shown.percent + "% - đang nén";
         }
 
         Notification notification = new NotificationCompat.Builder(this, CHANNEL_ID)
