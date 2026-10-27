@@ -210,8 +210,15 @@ public class VideoCompressionService extends Service {
             .build();
 
         try {
-            ServiceCompat.startForeground(
-                this, NOTIFICATION_ID, notification,
+            // Gọi thẳng Service.startForeground, KHÔNG qua ServiceCompat:
+            // ServiceCompat.Api34Impl AND type với một mask cứng các type có từ
+            // Android 14 (FOREGROUND_SERVICE_TYPE_ALLOWED_SINCE_U), mà
+            // mediaProcessing thì mới có ở Android 15. Qua nó, 8192 & mask = 0
+            // và hệ thống ném InvalidForegroundServiceTypeException "type none".
+            // Đo trên emulator API 36: startForegroundCount=0, service không bao
+            // giờ vào foreground.
+            startForeground(
+                NOTIFICATION_ID, notification,
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROCESSING
             );
             inForeground = true;
