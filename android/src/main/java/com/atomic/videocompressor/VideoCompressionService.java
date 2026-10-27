@@ -97,9 +97,9 @@ public class VideoCompressionService extends Service {
         super.onCreate();
         instance = this;
         NotificationChannel channel = new NotificationChannel(
-            CHANNEL_ID, "Xử lý và tải video lên", NotificationManager.IMPORTANCE_LOW
+            CHANNEL_ID, "Nén video", NotificationManager.IMPORTANCE_LOW
         );
-        channel.setDescription("Tiến trình nén và tải video lên");
+        channel.setDescription("Tiến trình nén video");
         NotificationManager manager = getSystemService(NotificationManager.class);
         if (manager != null) manager.createNotificationChannel(channel);
     }
