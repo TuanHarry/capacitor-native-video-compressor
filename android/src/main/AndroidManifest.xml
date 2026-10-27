@@ -1,17 +1,18 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <!-- Chỉ dataSync, không khai mediaProcessing.
-         Hai type nghĩa là hai quyền phải biện minh riêng trong Play Console với
-         cùng một video demo, và mediaProcessing khó thuyết phục hơn hẳn. dataSync
-         phủ được cả hai pha: nén rồi tải lên là một thao tác đồng bộ dữ liệu liên
-         tục do user khởi tạo - đúng ví dụ "upload photo to the cloud" mà policy nêu. -->
+    <!-- Hai type, vì job đi qua hai use case mà Google phân loại riêng: nén là
+         media transcoding, tải lên GCS là data sync. Bản 1.1.3 gộp cả hai vào
+         dataSync cho đỡ phải biện minh hai quyền, và Play từ chối version code
+         30 đúng vì thế: "Data Sync - Local Processing: Media Transcode ...
+         under the wrong FGS type". Service đổi type theo pha đang chạy. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROCESSING" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <application>
         <service
             android:name="com.atomic.videocompressor.VideoCompressionService"
-            android:foregroundServiceType="dataSync"
+            android:foregroundServiceType="mediaProcessing|dataSync"
             android:exported="false" />
     </application>
 </manifest>

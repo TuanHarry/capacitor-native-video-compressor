@@ -241,7 +241,7 @@ public class VideoCompressionService extends Service {
 
         try {
             ServiceCompat.startForeground(
-                this, NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+                this, NOTIFICATION_ID, notification, resolveForegroundType()
             );
             inForeground = true;
         } catch (Exception e) {
@@ -249,6 +249,34 @@ public class VideoCompressionService extends Service {
             // nén vẫn bị huỷ ngay khi user rời app và không ai biết tại sao.
             Log.e(TAG, "startForeground thất bại - tiến trình có thể bị huỷ khi rời app", e);
         }
+    }
+
+    /**
+     * Type phải đổi theo pha chứ không cố định: Play xếp nén vào media
+     * transcoding còn tải lên vào data sync, và khai nén dưới dataSync chính là
+     * lý do version code 30 bị từ chối. Nhiều job song song thì lấy hợp của các
+     * pha, vì cả service chỉ có một notification chung cho chúng.
+     */
+    private int resolveForegroundType() {
+        int type = 0;
+        for (Job job : jobs.values()) {
+            type |= job.phase == Phase.UPLOADING
+                ? ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+                : mediaProcessingType();
+        }
+        return type;
+    }
+
+    /**
+     * mediaProcessing chỉ tồn tại từ API 35; thiết bị cũ hơn không nhận type này
+     * và startForeground sẽ ném. Ở đó pha nén vẫn chạy dưới dataSync như bản
+     * 1.1.3. destini-web đặt minSdk 35 nên nhánh fallback không bao giờ chạy
+     * trong app đó, nhưng plugin build độc lập vẫn hạ tới minSdk 24.
+     */
+    private static int mediaProcessingType() {
+        return Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM
+            ? ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROCESSING
+            : ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC;
     }
 
     /**
@@ -291,7 +319,8 @@ public class VideoCompressionService extends Service {
     }
 
     /**
-     * Android 15+ giới hạn dataSync tổng 6 giờ/24 giờ rồi gọi onTimeout. Phải
+     * Android 15+ giới hạn dataSync và mediaProcessing mỗi loại 6 giờ/24 giờ
+     * rồi gọi onTimeout, và service này dùng cả hai type. Phải
      * dừng trong vài giây, nếu không app ăn ANR. destini-web đặt minSdk 35 nên
      * mọi thiết bị đều ở trong diện này.
      */
