@@ -52,18 +52,22 @@ allprojects {
 }
 ```
 
-#### compileSdk 35+ (required)
+#### minSdk 35 / compileSdk 35+ (required)
 
-The compression foreground service declares `android:foregroundServiceType="mediaProcessing|dataSync"`.
-`mediaProcessing` exists only from **API 35 (Android 15)**, so your app must build with
-`compileSdkVersion` 35 or higher.
+The compression foreground service declares `android:foregroundServiceType="mediaProcessing"`,
+and `mediaProcessing` exists only from **API 35 (Android 15)**. On API 34 and below the
+system reads the type as unknown and `startForeground()` throws
+`InvalidForegroundServiceTypeException` - the service never reaches the foreground and
+compression is killed as soon as the user leaves the app. There is no second type to fall
+back to, so the plugin requires `minSdkVersion` 35.
 
-At runtime the service picks the type by API level: `mediaProcessing` on API 35+,
-`dataSync` on API 29-34. Both types and both permissions are declared, so the plugin
-runs correctly on Android 10 through 15+. Passing only `mediaProcessing` on API 34
-makes the system read the type as unknown and `startForeground()` throws
-`InvalidForegroundServiceTypeException` - the service never reaches the foreground
-and compression is killed as soon as the user leaves the app.
+**The service covers compression only.** It stops as soon as the compress finishes. Anything
+you do with the output afterwards - uploading it, for instance - runs without a foreground
+service, because JS in the webview is paused while the app is backgrounded anyway: holding
+the service open for it would declare work that does not happen. Google Play classifies
+foreground services by *use case*, not by how many services you run, and a `dataSync`
+declaration covering a phase that is really "waiting for the user to come back" is what got
+version code 30 of Destini rejected.
 
 ## Web Configuration (Required)
 
@@ -226,7 +230,6 @@ The `quality` parameter determines the output resolution and compression ratio. 
 * [`compressVideo(...)`](#compressvideo)
 * [`cancel(...)`](#cancel)
 * [`initialize()`](#initialize)
-* [`finishUpload(...)`](#finishupload)
 * [`addListener('onProgress', ...)`](#addlisteneronprogress-)
 * [`addListener('onCancelRequested', ...)`](#addlisteneroncancelrequested-)
 * [Interfaces](#interfaces)
@@ -284,24 +287,6 @@ initialize() => Promise<{ success: boolean; message?: string; }>
 --------------------
 
 
-### finishUpload(...)
-
-```typescript
-finishUpload(options: { jobId: string; }) => Promise<void>
-```
-
-Báo rằng phần upload đi kèm `holdForUpload` đã xong (thành công hay thất
-bại đều phải gọi) để Android hạ foreground service xuống.
-
-No-op trên web và iOS.
-
-| Param         | Type                            |
-| ------------- | ------------------------------- |
-| **`options`** | <code>{ jobId: string; }</code> |
-
---------------------
-
-
 ### addListener('onProgress', ...)
 
 ```typescript
@@ -326,10 +311,10 @@ addListener(eventName: 'onCancelRequested', listenerFunc: () => void) => Promise
 
 Android: user đã bấm "Huỷ" trên notification của foreground service.
 
-Pha nén được plugin tự huỷ trước khi event này bắn, nhưng pha upload chạy
-trong JS nên không ai dừng hộ được - caller phải tự abort request đang
-chạy. Bỏ qua event này nghĩa là nút Huỷ không thật sự huỷ, và Play đánh
-trượt tiêu chí "can be terminated or stopped by the user".
+Pha nén được plugin tự huỷ trước khi event này bắn, nhưng việc caller định
+làm với kết quả nén - upload chẳng hạn - thì không ai dừng hộ được, nên
+caller phải tự abort. Bỏ qua event này nghĩa là nút Huỷ không thật sự huỷ,
+và Play đánh trượt tiêu chí "can be terminated or stopped by the user".
 
 | Param              | Type                             |
 | ------------------ | -------------------------------- |
@@ -354,13 +339,12 @@ trượt tiêu chí "can be terminated or stopped by the user".
 
 #### CompressOptions
 
-| Prop                | Type                                                                            | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| ------------------- | ------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **`sourcePath`**    | <code>string</code>                                                             |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
-| **`destPath`**      | <code>string</code>                                                             |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
-| **`quality`**       | <code>'VERY_HIGH' \| 'HIGH' \| 'MEDIUM' \| 'LOW' \| 'VERY_LOW' \| '360P'</code> |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
-| **`jobId`**         | <code>string</code>                                                             | Names this compress so `cancel({ jobId })` can target it. Every platform compresses one video at a time, so cancellation is global by nature. Two independent callers in the same app (say a comment queue and a notes queue) therefore need a way to say *which* job they mean — without one, a cancel from either kills whatever the other is running.                                                                                                                           |
-| **`holdForUpload`** | <code>boolean</code>                                                            | Android: giữ foreground service sống sau khi nén xong, để phần upload do JS chạy tiếp theo không bị hệ thống giết khi user rời app. Bật cờ này là một lời hứa: caller PHẢI gọi {@link NativeVideoCompressorPlugin.finishUpload} khi upload kết thúc, kể cả ở nhánh lỗi. Không gọi thì service chỉ còn watchdog dọn hộ sau 15 phút, và trong 15 phút đó user nhìn thấy một notification nói rằng app đang làm việc trong khi nó không làm gì cả. Không có tác dụng trên web và iOS. |
+| Prop             | Type                                                                            | Description                                                                                                                                                                                                                                                                                                                                              |
+| ---------------- | ------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **`sourcePath`** | <code>string</code>                                                             |                                                                                                                                                                                                                                                                                                                                                          |
+| **`destPath`**   | <code>string</code>                                                             |                                                                                                                                                                                                                                                                                                                                                          |
+| **`quality`**    | <code>'VERY_HIGH' \| 'HIGH' \| 'MEDIUM' \| 'LOW' \| 'VERY_LOW' \| '360P'</code> |                                                                                                                                                                                                                                                                                                                                                          |
+| **`jobId`**      | <code>string</code>                                                             | Names this compress so `cancel({ jobId })` can target it. Every platform compresses one video at a time, so cancellation is global by nature. Two independent callers in the same app (say a comment queue and a notes queue) therefore need a way to say *which* job they mean — without one, a cancel from either kills whatever the other is running. |
 
 
 #### CancelResult

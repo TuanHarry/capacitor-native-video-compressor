@@ -7,7 +7,6 @@ import android.app.PendingIntent;
 import android.app.Service;
 import android.content.Intent;
 import android.content.pm.ServiceInfo;
-import android.os.Build;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
@@ -20,13 +19,18 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 
 /**
- * Giữ tiến trình nén + upload sống khi user rời app.
+ * Giữ pha nén sống khi user rời app.
+ *
+ * Chỉ pha nén, không kèm upload: upload chạy bằng JS trong webview nên nó đứng
+ * lại ngay khi app xuống nền, và một foreground service ngồi chờ user quay lại
+ * là khai một việc không diễn ra - Play từ chối version code 30 vì đúng loại
+ * sai lệch đó (nén khai dưới dataSync). Service giờ sống đúng bằng pha nén.
  *
  * Mọi thứ trong đây phải đáp ứng được 5 tiêu chí foreground service của Google
  * Play, vì bản thiếu chúng (1.1.0) đã bị từ chối ở version code 29:
  *
- *  - user perceptible  -> notification có progress thật, cập nhật theo % nén
- *    và theo pha (nén / tải lên), chứ không phải một dòng chữ tĩnh
+ *  - user perceptible  -> notification có progress thật, cập nhật theo % nén,
+ *    chứ không phải một dòng chữ tĩnh
  *  - stoppable by user -> action "Huỷ" ngay trên notification, vì khi user đã
  *    rời app thì UI trong app không còn với tới được
  *  - runs only as long as necessary -> watchdog tự tắt khi không còn ai báo
@@ -39,7 +43,6 @@ public class VideoCompressionService extends Service {
     private static final int NOTIFICATION_ID = 1001;
 
     static final String ACTION_START = "com.atomic.videocompressor.START";
-    static final String ACTION_UPLOAD = "com.atomic.videocompressor.UPLOAD";
     static final String ACTION_FINISH = "com.atomic.videocompressor.FINISH";
     /** Do chính user bấm từ notification. */
     static final String ACTION_CANCEL = "com.atomic.videocompressor.CANCEL";
@@ -49,24 +52,21 @@ public class VideoCompressionService extends Service {
 
     /**
      * Không nhận được update nào trong khoảng này thì coi như phía gọi đã chết
-     * (WebView bị kill, hoặc một exception thoát ra ngoài nhánh finishUpload) và
-     * tự dừng. Không có nó, `jobs` không bao giờ rỗng và service chạy mãi với
-     * một notification treo - đúng thứ khiến Play đánh trượt tiêu chí "runs only
-     * for as long as necessary".
+     * (WebView bị kill, hoặc một exception thoát ra ngoài mọi nhánh kết thúc
+     * job) và tự dừng. Không có nó, `jobs` không bao giờ rỗng và service chạy
+     * mãi với một notification treo - đúng thứ khiến Play đánh trượt tiêu chí
+     * "runs only for as long as necessary".
      *
-     * Chọn 15 phút: dài hơn mọi khoảng lặng hợp lệ (upload một video đã nén trên
-     * mạng chậm, hoặc pha nén chưa kịp bắn progress đầu tiên), ngắn hơn nhiều so
-     * với mức mà user kịp nhận ra có gì đó treo.
+     * Chọn 15 phút: dài hơn mọi khoảng lặng hợp lệ (pha nén chưa kịp bắn
+     * progress đầu tiên trên một video dài), ngắn hơn nhiều so với mức mà user
+     * kịp nhận ra có gì đó treo.
      */
     private static final long WATCHDOG_MS = 15 * 60 * 1000L;
 
     /** Đừng vẽ lại notification mỗi tick progress của LightCompressor. */
     private static final long MIN_REDRAW_INTERVAL_MS = 500L;
 
-    private enum Phase { COMPRESSING, UPLOADING }
-
     private static final class Job {
-        Phase phase = Phase.COMPRESSING;
         int percent = 0;
     }
 
@@ -167,14 +167,6 @@ public class VideoCompressionService extends Service {
 
         if (ACTION_START.equals(action)) {
             jobs.put(jobId, new Job());
-        } else if (ACTION_UPLOAD.equals(action)) {
-            Job job = jobs.get(jobId);
-            if (job != null) {
-                job.phase = Phase.UPLOADING;
-                // Pha upload không có % nào bắn về, nên thanh progress chuyển
-                // sang indeterminate thay vì đứng im ở con số của pha nén.
-                job.percent = -1;
-            }
         } else if (ACTION_FINISH.equals(action)) {
             jobs.remove(jobId);
         }
@@ -198,38 +190,16 @@ public class VideoCompressionService extends Service {
     private void render() {
         Job shown = jobs.values().iterator().next();
         int running = jobs.size();
-        boolean indeterminate = shown.percent < 0;
 
-        String title;
-        if (running > 1) {
-            title = "Đang xử lý " + running + " video";
-        } else {
-            title = shown.phase == Phase.UPLOADING ? "Đang tải video lên" : "Đang nén video";
-        }
-
-        // Hai pha nói hai điều khác nhau, vì chúng chạy ở hai nơi khác nhau.
-        //
-        // Nén chạy ở native trong chính service này nên vẫn chạy khi app
-        // xuống nền. Upload thì chạy bằng JS trong webview, nên nó đứng lại
-        // và chỉ tiếp tục khi app trở lại foreground - đo được: nén xong là
-        // mọi hoạt động mạng dừng hẳn cho tới khi watchdog tự dừng service
-        // sau 15 phút. Vì vậy pha upload phải nói rõ việc người dùng cần làm.
-        String text;
-        if (shown.phase == Phase.UPLOADING) {
-            text = indeterminate
-                ? "Mở lại ứng dụng để hoàn tất tải lên"
-                : shown.percent + "% - mở lại ứng dụng để hoàn tất tải lên";
-        } else {
-            text = indeterminate
-                ? "Đang nén video"
-                : shown.percent + "% - đang nén";
-        }
+        String title = running > 1
+            ? "Đang nén " + running + " video"
+            : "Đang nén video";
 
         Notification notification = new NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle(title)
-            .setContentText(text)
+            .setContentText(shown.percent + "% - đang nén")
             .setSmallIcon(resolveSmallIcon())
-            .setProgress(100, indeterminate ? 0 : shown.percent, indeterminate)
+            .setProgress(100, shown.percent, false)
             .setOngoing(true)
             // Không có nó, mỗi lần vẽ lại progress là một lần notification
             // nhảy lên đầu danh sách và rung máy.
@@ -241,7 +211,8 @@ public class VideoCompressionService extends Service {
 
         try {
             ServiceCompat.startForeground(
-                this, NOTIFICATION_ID, notification, resolveForegroundType()
+                this, NOTIFICATION_ID, notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROCESSING
             );
             inForeground = true;
         } catch (Exception e) {
@@ -249,34 +220,6 @@ public class VideoCompressionService extends Service {
             // nén vẫn bị huỷ ngay khi user rời app và không ai biết tại sao.
             Log.e(TAG, "startForeground thất bại - tiến trình có thể bị huỷ khi rời app", e);
         }
-    }
-
-    /**
-     * Type phải đổi theo pha chứ không cố định: Play xếp nén vào media
-     * transcoding còn tải lên vào data sync, và khai nén dưới dataSync chính là
-     * lý do version code 30 bị từ chối. Nhiều job song song thì lấy hợp của các
-     * pha, vì cả service chỉ có một notification chung cho chúng.
-     */
-    private int resolveForegroundType() {
-        int type = 0;
-        for (Job job : jobs.values()) {
-            type |= job.phase == Phase.UPLOADING
-                ? ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
-                : mediaProcessingType();
-        }
-        return type;
-    }
-
-    /**
-     * mediaProcessing chỉ tồn tại từ API 35; thiết bị cũ hơn không nhận type này
-     * và startForeground sẽ ném. Ở đó pha nén vẫn chạy dưới dataSync như bản
-     * 1.1.3. destini-web đặt minSdk 35 nên nhánh fallback không bao giờ chạy
-     * trong app đó, nhưng plugin build độc lập vẫn hạ tới minSdk 24.
-     */
-    private static int mediaProcessingType() {
-        return Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM
-            ? ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROCESSING
-            : ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC;
     }
 
     /**
@@ -319,8 +262,7 @@ public class VideoCompressionService extends Service {
     }
 
     /**
-     * Android 15+ giới hạn dataSync và mediaProcessing mỗi loại 6 giờ/24 giờ
-     * rồi gọi onTimeout, và service này dùng cả hai type. Phải
+     * Android 15+ giới hạn mediaProcessing tổng 6 giờ/24 giờ rồi gọi onTimeout. Phải
      * dừng trong vài giây, nếu không app ăn ANR. destini-web đặt minSdk 35 nên
      * mọi thiết bị đều ở trong diện này.
      */
@@ -331,7 +273,11 @@ public class VideoCompressionService extends Service {
         stopEverything();
     }
 
-    /** Overload của API 34, giữ lại cho thiết bị chạy Android 14. */
+    /**
+     * Overload của API 34. minSdk 35 nên hệ thống luôn gọi bản hai tham số ở
+     * trên; giữ lại vì bản mặc định của Service không làm gì, và một thiết bị
+     * gọi nhầm vào đây mà service không dừng thì app ăn ANR.
+     */
     @Override
     public void onTimeout(int startId) {
         Log.w(TAG, "Hệ thống hết hạn foreground service - dừng ngay");

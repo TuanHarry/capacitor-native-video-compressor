@@ -21,7 +21,10 @@ android {
     namespace = "com.atomic.videocompressor"
     compileSdk = project.hasProperty('compileSdkVersion') ? rootProject.ext.compileSdkVersion : 36
     defaultConfig {
-        minSdkVersion project.hasProperty('minSdkVersion') ? rootProject.ext.minSdkVersion : 24
+        // 35, không phải 24: foreground service của pha nén khai mediaProcessing,
+        // type chỉ tồn tại từ API 35. Dưới mức đó hệ thống đọc ra "type unknown"
+        // và startForeground() ném InvalidForegroundServiceTypeException.
+        minSdkVersion project.hasProperty('minSdkVersion') ? rootProject.ext.minSdkVersion : 35
         targetSdkVersion project.hasProperty('targetSdkVersion') ? rootProject.ext.targetSdkVersion : 36
         versionCode 1
         versionName "1.0"

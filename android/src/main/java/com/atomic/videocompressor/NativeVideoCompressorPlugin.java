@@ -118,15 +118,6 @@ public class NativeVideoCompressorPlugin extends Plugin {
     }
 
     @PluginMethod
-    public void finishUpload(PluginCall call) {
-        String jobId = call.getString("jobId");
-        if (jobId != null) {
-            sendToService(VideoCompressionService.ACTION_FINISH, jobId);
-        }
-        call.resolve();
-    }
-
-    @PluginMethod
     public void compressVideo(PluginCall call) {
         String sourcePath = call.getString("sourcePath");
 
@@ -136,7 +127,6 @@ public class NativeVideoCompressorPlugin extends Plugin {
         }
 
         String jobId = call.getString("jobId", "default");
-        boolean holdForUpload = Boolean.TRUE.equals(call.getBoolean("holdForUpload", false));
         synchronized (this) {
             currentJobId = jobId;
         }
@@ -233,13 +223,13 @@ public class NativeVideoCompressorPlugin extends Plugin {
 
                 @Override
                 public void onFailure(int i, @NonNull String failureMessage) {
-                    finishJob(jobId, false);
+                    finishJob(jobId);
                     call.reject("Nén thất bại: " + failureMessage);
                 }
 
                 @Override
                 public void onSuccess(int i, long l, @Nullable String s) {
-                    finishJob(jobId, holdForUpload);
+                    finishJob(jobId);
                     // Nén xong, trả kết quả đường dẫn file mới về cho JS
                     JSObject ret = new JSObject();
                     ret.put("success", true);
@@ -256,7 +246,7 @@ public class NativeVideoCompressorPlugin extends Plugin {
 
                 @Override
                 public void onCancelled(int i) {
-                    finishJob(jobId, false);
+                    finishJob(jobId);
                     // LightCompressor leaves whatever it had already written
                     // behind; without this the cache keeps a partial mp4 per
                     // cancel, and nothing ever collects them.
@@ -270,11 +260,8 @@ public class NativeVideoCompressorPlugin extends Plugin {
     }
 
     /** Every terminal callback ends here, so neither is ever left running. */
-    private void finishJob(String jobId, boolean holdForUpload) {
-        sendToService(
-            holdForUpload ? VideoCompressionService.ACTION_UPLOAD : VideoCompressionService.ACTION_FINISH,
-            jobId
-        );
+    private void finishJob(String jobId) {
+        sendToService(VideoCompressionService.ACTION_FINISH, jobId);
         synchronized (this) {
             currentJobId = null;
         }
