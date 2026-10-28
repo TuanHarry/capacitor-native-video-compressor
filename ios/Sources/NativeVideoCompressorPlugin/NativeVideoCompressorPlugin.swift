@@ -16,7 +16,6 @@ public class NativeVideoCompressorPlugin: CAPPlugin, CAPBridgedPlugin {
         CAPPluginMethod(name: "compressVideo", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "cancel", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "initialize", returnType: CAPPluginReturnPromise),
-        CAPPluginMethod(name: "finishUpload", returnType: CAPPluginReturnPromise)
     ]
 
     /// The job `compressVideo` is running right now, for `cancel(jobId:)`.
@@ -42,13 +41,6 @@ public class NativeVideoCompressorPlugin: CAPPlugin, CAPBridgedPlugin {
      * down the `else` branch — `markAsFinished()`, `group.leave()` — and the
      * existing completion handler runs. No new exit path, no polling.
      */
-    /// Chỉ Android mới có foreground service để hạ xuống. Khai ở đây để caller
-    /// gọi thẳng mà không phải rẽ nhánh theo platform ở mọi call site - thiếu
-    /// nó thì mỗi lần gọi trên iOS là một promise bị reject "not implemented".
-    @objc func finishUpload(_ call: CAPPluginCall) {
-        call.resolve()
-    }
-
     @objc func cancel(_ call: CAPPluginCall) {
         stateLock.lock()
         let running = currentJobId

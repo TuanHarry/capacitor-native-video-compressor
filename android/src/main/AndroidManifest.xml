@@ -1,17 +1,20 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <!-- Chỉ dataSync, không khai mediaProcessing.
-         Hai type nghĩa là hai quyền phải biện minh riêng trong Play Console với
-         cùng một video demo, và mediaProcessing khó thuyết phục hơn hẳn. dataSync
-         phủ được cả hai pha: nén rồi tải lên là một thao tác đồng bộ dữ liệu liên
-         tục do user khởi tạo - đúng ví dụ "upload photo to the cloud" mà policy nêu. -->
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <!-- Chỉ mediaProcessing: service sống đúng bằng pha nén, là use case duy
+         nhất ở đây thực sự chạy khi user rời app. Không khai dataSync nữa, vì
+         pha upload chạy bằng JS trong webview nên nó đứng lại ngay khi app
+         xuống nền - giữ foreground service cho nó là khai một việc không diễn
+         ra, và Play xét FGS theo use case chứ không theo số service.
+
+         mediaProcessing chỉ có từ API 35, và ở đây không còn type nào để hạ
+         xuống, nên minSdk của plugin là 35 (xem android/build.gradle). -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROCESSING" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <application>
         <service
             android:name="com.atomic.videocompressor.VideoCompressionService"
-            android:foregroundServiceType="dataSync"
+            android:foregroundServiceType="mediaProcessing"
             android:exported="false" />
     </application>
 </manifest>

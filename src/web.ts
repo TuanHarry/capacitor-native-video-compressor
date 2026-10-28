@@ -160,14 +160,6 @@ export class NativeVideoCompressorWeb extends WebPlugin implements NativeVideoCo
    * stop it — its cost is the loaded core, which is why the core URLs are
    * cached above.
    */
-  /**
-   * Chỉ Android mới có foreground service để mà hạ xuống. Hiện diện ở đây để
-   * caller gọi thẳng, không phải rẽ nhánh theo platform ở mọi call site.
-   */
-  async finishUpload(): Promise<void> {
-    return;
-  }
-
   async cancel(options?: CancelOptions): Promise<CancelResult> {
     if (!this.currentJobId) return { cancelled: false };
     if (options?.jobId && options.jobId !== this.currentJobId) return { cancelled: false };
