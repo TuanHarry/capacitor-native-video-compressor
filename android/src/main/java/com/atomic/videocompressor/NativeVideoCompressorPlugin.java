@@ -272,8 +272,8 @@ public class NativeVideoCompressorPlugin extends Plugin {
      *
      * startService() từ background bị chặn khi app không còn foreground service
      * nào chạy - đúng tình huống xảy ra khi service đã tự tắt bằng watchdog rồi
-     * JS mới gọi finishUpload. Ném ra ở đây sẽ biến một lần dọn dẹp vô hại thành
-     * một lần nén báo lỗi cho user.
+     * job mới kết thúc và gửi ACTION_FINISH. Ném ra ở đây sẽ biến một lần dọn dẹp
+     * vô hại thành một lần nén báo lỗi cho user.
      */
     private void sendToService(String action, String jobId) {
         try {
