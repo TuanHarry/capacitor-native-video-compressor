@@ -1,10 +1,13 @@
 package com.atomic.videocompressor;
 
-import android.content.Intent;
 import android.net.Uri;
 import android.util.Log;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
+import androidx.work.Data;
+import androidx.work.ExistingWorkPolicy;
+import androidx.work.OneTimeWorkRequest;
+import androidx.work.WorkManager;
 import com.abedelazizshe.lightcompressorlibrary.CompressionListener;
 import com.abedelazizshe.lightcompressorlibrary.VideoCompressor;
 import com.abedelazizshe.lightcompressorlibrary.VideoQuality;
@@ -16,12 +19,15 @@ import com.getcapacitor.PluginCall;
 import com.getcapacitor.PluginMethod;
 import com.getcapacitor.annotation.CapacitorPlugin;
 import java.io.File;
-import java.lang.ref.WeakReference;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 @CapacitorPlugin(name = "NativeVideoCompressor")
 public class NativeVideoCompressorPlugin extends Plugin {
+
+    private static final String TAG = "NativeVideoCompressor";
 
     /**
      * Matches the `CANCELLED` constant the JS side exports, so one
@@ -31,51 +37,8 @@ public class NativeVideoCompressorPlugin extends Plugin {
 
     private static final String STORAGE_SUBFOLDER = "compressed_videos";
 
-    /**
-     * Instance đang sống, để service gọi ngược khi user bấm "Huỷ" trên
-     * notification. WeakReference vì service sống lâu hơn bridge: giữ cứng ở
-     * đây là giữ luôn cả WebView sau khi Activity đã chết.
-     */
-    private static WeakReference<NativeVideoCompressorPlugin> active = new WeakReference<>(null);
-
     /** The job compressVideo is running right now, for cancel({ jobId }). */
     private String currentJobId = null;
-
-    @Override
-    public void load() {
-        super.load();
-        active = new WeakReference<>(this);
-    }
-
-    @Override
-    protected void handleOnDestroy() {
-        if (active.get() == this) active = new WeakReference<>(null);
-        super.handleOnDestroy();
-    }
-
-    /**
-     * User bấm "Huỷ" trên notification. Phải huỷ được cả hai pha:
-     *
-     *  - pha nén chạy trong LightCompressor (native) -> cancel() tĩnh, gọi được
-     *    kể cả khi bridge đã chết
-     *  - pha upload chạy trong JS -> chỉ có thể nhờ JS tự dừng, nên bắn
-     *    onCancelRequested; không có event này thì bấm Huỷ lúc đang upload chỉ
-     *    tắt được notification còn request vẫn chạy tiếp, và Play coi như
-     *    "không dừng được bởi user".
-     */
-    static void cancelAllFromNotification() {
-        try {
-            VideoCompressor.cancel();
-        } catch (Exception e) {
-            Log.w("NativeVideoCompressor", "Could not cancel compression", e);
-        }
-        NativeVideoCompressorPlugin plugin = active.get();
-        if (plugin == null) return;
-        synchronized (plugin) {
-            plugin.currentJobId = null;
-        }
-        plugin.notifyListeners("onCancelRequested", new JSObject());
-    }
 
     /**
      * Nothing to do natively; LightCompressor needs no warm-up. Answered
@@ -104,11 +67,15 @@ public class NativeVideoCompressorPlugin extends Plugin {
         // running job could finish and a new one start in the gap — and
         // VideoCompressor.cancel() being global, it would kill the newcomer.
         // That is exactly what checking the jobId is meant to prevent.
-        // The call is non-blocking (it cancels a coroutine job), so holding
-        // the lock across it costs nothing.
+        // Both calls are non-blocking (one cancels a coroutine job, the other
+        // returns an Operation), so holding the lock across them costs nothing.
         synchronized (this) {
             cancelled = currentJobId != null && (requested == null || requested.equals(currentJobId));
             if (cancelled) {
+                // Huỷ cả work: pha nén có thể chưa kịp bắt đầu, lúc đó
+                // VideoCompressor.cancel() không có gì để huỷ và work vẫn sẽ
+                // chạy sau đó. Huỷ work làm onStopped bắn và job tự kết thúc.
+                cancelWork(currentJobId);
                 VideoCompressor.cancel();
             }
         }
@@ -127,9 +94,6 @@ public class NativeVideoCompressorPlugin extends Plugin {
         }
 
         String jobId = call.getString("jobId", "default");
-        synchronized (this) {
-            currentJobId = jobId;
-        }
 
         // 1. Chuẩn bị Uri và Tên file xuất ra
         Uri srcUri;
@@ -161,10 +125,7 @@ public class NativeVideoCompressorPlugin extends Plugin {
             }
         }
 
-        Log.d(
-            "NativeVideoCompressor",
-            "====== VIDEO COMPRESSION QUALITY RECEIVED: " + qualityString + "+ video quality: " + videoQuality + " ======"
-        );
+        Log.d(TAG, "====== VIDEO COMPRESSION QUALITY RECEIVED: " + qualityString + "+ video quality: " + videoQuality + " ======");
 
         // 2. Cấu hình thông số nén (Dành riêng cho LightCompressor 1.3.2)
         // Lưu ý: Java phải truyền đủ 9 tham số do thư viện gốc viết bằng Kotlin
@@ -182,38 +143,132 @@ public class NativeVideoCompressorPlugin extends Plugin {
         // 3. Cấu hình nơi lưu (Lưu an toàn vào thư mục nội bộ của App)
         AppSpecificStorageConfiguration storageConfig = new AppSpecificStorageConfiguration(STORAGE_SUBFOLDER);
 
-        // Khởi động Foreground Service để giữ app luôn sống khi chạy ngầm
-        Intent serviceIntent = new Intent(getContext(), VideoCompressionService.class);
-        serviceIntent.setAction(VideoCompressionService.ACTION_START);
-        serviceIntent.putExtra(VideoCompressionService.EXTRA_JOB_ID, jobId);
-        try {
-            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
-                getContext().startForegroundService(serviceIntent);
-            } else {
-                getContext().startService(serviceIntent);
-            }
-        } catch (Exception e) {
-            synchronized (this) { currentJobId = null; }
-            call.reject("Cannot start foreground video processing", e);
-            return;
+        synchronized (this) {
+            currentJobId = jobId;
         }
 
-        // 4. Bắt đầu nén (Đã cập nhật List Uri và int index)
-        VideoCompressor.start(
-            getContext(),
-            Collections.singletonList(srcUri), // Nhận vào một List chứa đường dẫn
-            false, // isStreamable
-            null, // sharedStorageConfiguration (Không dùng)
-            storageConfig, // Cấu hình lưu trữ
-            configuration, // Cấu hình chất lượng
-            new CompressionListener() {
+        // 4. Giao pha nén cho WorkManager. Không nén thẳng ở đây: một thread
+        // thường bị đóng băng cùng process ngay khi user rời app, còn process
+        // đang chạy worker thì không. Đây là phương án Google Play chỉ đích
+        // danh khi từ chối foreground service ở version code 32.
+        CompressionJob job = new CompressionJob(jobId, srcUri, fileName, configuration, storageConfig, call);
+        VideoCompressionWorker.register(jobId, job);
+
+        OneTimeWorkRequest request = new OneTimeWorkRequest.Builder(VideoCompressionWorker.class)
+            .setInputData(new Data.Builder().putString(VideoCompressionWorker.KEY_JOB_ID, jobId).build())
+            .build();
+
+        try {
+            WorkManager.getInstance(getContext()).enqueueUniqueWork(workName(jobId), ExistingWorkPolicy.REPLACE, request);
+        } catch (Exception e) {
+            VideoCompressionWorker.unregister(jobId);
+            synchronized (this) {
+                currentJobId = null;
+            }
+            call.reject("Cannot schedule video compression", e);
+        }
+    }
+
+    /**
+     * Một lần nén, chạy bên trong {@link VideoCompressionWorker}.
+     *
+     * Không phải static: nó cần notifyListeners và getContext của plugin đang
+     * sống để bắn progress và trả kết quả về đúng PluginCall.
+     */
+    private final class CompressionJob implements VideoCompressionWorker.Job {
+
+        private final String jobId;
+        private final Uri srcUri;
+        private final String fileName;
+        private final Configuration configuration;
+        private final AppSpecificStorageConfiguration storageConfig;
+        private final PluginCall call;
+
+        /** Mở khi pha nén kết thúc, để worker biết lúc nào được trả về. */
+        private final CountDownLatch done = new CountDownLatch(1);
+
+        /** Chốt một-lần cho mọi nhánh kết thúc; PluginCall chỉ được trả lời một lần. */
+        private final AtomicBoolean delivered = new AtomicBoolean(false);
+
+        private boolean started = false;
+        private boolean stopped = false;
+
+        CompressionJob(
+            String jobId,
+            Uri srcUri,
+            String fileName,
+            Configuration configuration,
+            AppSpecificStorageConfiguration storageConfig,
+            PluginCall call
+        ) {
+            this.jobId = jobId;
+            this.srcUri = srcUri;
+            this.fileName = fileName;
+            this.configuration = configuration;
+            this.storageConfig = storageConfig;
+            this.call = call;
+        }
+
+        @Override
+        public void run() {
+            synchronized (this) {
+                // stop() đã chạy trước khi worker kịp khởi động: đừng bắt đầu
+                // một lần nén mà không còn ai chờ kết quả.
+                if (!stopped) {
+                    VideoCompressor.start(
+                        getContext(),
+                        Collections.singletonList(srcUri), // Nhận vào một List chứa đường dẫn
+                        false, // isStreamable
+                        null, // sharedStorageConfiguration (Không dùng)
+                        storageConfig, // Cấu hình lưu trữ
+                        configuration, // Cấu hình chất lượng
+                        listener()
+                    );
+                    started = true;
+                }
+            }
+
+            if (!started) {
+                deliverCancelled();
+                return;
+            }
+
+            try {
+                done.await();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                deliverCancelled();
+            }
+        }
+
+        @Override
+        public void stop() {
+            boolean wasRunning;
+            synchronized (this) {
+                if (stopped) return;
+                stopped = true;
+                wasRunning = started;
+            }
+
+            if (wasRunning) {
+                // onCancelled của LightCompressor sẽ mở chốt; không tự gọi
+                // deliverCancelled ở đây để nhánh dọn file tạm vẫn chạy.
+                try {
+                    VideoCompressor.cancel();
+                } catch (Exception e) {
+                    Log.w(TAG, "Could not cancel compression", e);
+                    deliverCancelled();
+                }
+            } else {
+                // Chưa bắt đầu thì không có callback nào bắn, phải tự kết thúc.
+                deliverCancelled();
+            }
+        }
+
+        private CompressionListener listener() {
+            return new CompressionListener() {
                 @Override
                 public void onProgress(int i, float v) {
-                    // Notification phải nhúc nhích theo đúng con số mà UI trong
-                    // app đang hiển thị: một notification đứng im là lý do Play
-                    // đánh trượt tiêu chí "user perceptible".
-                    VideoCompressionService.publishProgress(jobId, Math.round(v));
-
                     // Gửi % tiến độ về Javascript để vẽ thanh Progress
                     JSObject ret = new JSObject();
                     ret.put("status", "progress");
@@ -223,13 +278,13 @@ public class NativeVideoCompressorPlugin extends Plugin {
 
                 @Override
                 public void onFailure(int i, @NonNull String failureMessage) {
-                    finishJob(jobId);
+                    if (!claim()) return;
                     call.reject("Nén thất bại: " + failureMessage);
                 }
 
                 @Override
                 public void onSuccess(int i, long l, @Nullable String s) {
-                    finishJob(jobId);
+                    if (!claim()) return;
                     // Nén xong, trả kết quả đường dẫn file mới về cho JS
                     JSObject ret = new JSObject();
                     ret.put("success", true);
@@ -246,43 +301,43 @@ public class NativeVideoCompressorPlugin extends Plugin {
 
                 @Override
                 public void onCancelled(int i) {
-                    finishJob(jobId);
-                    // LightCompressor leaves whatever it had already written
-                    // behind; without this the cache keeps a partial mp4 per
-                    // cancel, and nothing ever collects them.
-                    deleteOutput(fileName);
-                    // Coded so the caller can tell "the user asked for this"
-                    // apart from a real failure — same code on every platform.
-                    call.reject("Đã hủy nén", CANCELLED_CODE);
+                    deliverCancelled();
                 }
-            }
-        );
-    }
+            };
+        }
 
-    /** Every terminal callback ends here, so neither is ever left running. */
-    private void finishJob(String jobId) {
-        sendToService(VideoCompressionService.ACTION_FINISH, jobId);
-        synchronized (this) {
-            currentJobId = null;
+        private void deliverCancelled() {
+            if (!claim()) return;
+            // LightCompressor leaves whatever it had already written behind;
+            // without this the cache keeps a partial mp4 per cancel, and
+            // nothing ever collects them.
+            deleteOutput(fileName);
+            // Coded so the caller can tell "the user asked for this" apart
+            // from a real failure — same code on every platform.
+            call.reject("Đã hủy nén", CANCELLED_CODE);
+        }
+
+        /** True đúng một lần, cho nhánh kết thúc đầu tiên tới đích. */
+        private boolean claim() {
+            if (!delivered.compareAndSet(false, true)) return false;
+            synchronized (NativeVideoCompressorPlugin.this) {
+                if (jobId.equals(currentJobId)) currentJobId = null;
+            }
+            done.countDown();
+            return true;
         }
     }
 
-    /**
-     * Lệnh gửi vào service, nuốt lỗi có chủ đích.
-     *
-     * startService() từ background bị chặn khi app không còn foreground service
-     * nào chạy - đúng tình huống xảy ra khi service đã tự tắt bằng watchdog rồi
-     * job mới kết thúc và gửi ACTION_FINISH. Ném ra ở đây sẽ biến một lần dọn dẹp
-     * vô hại thành một lần nén báo lỗi cho user.
-     */
-    private void sendToService(String action, String jobId) {
+    private String workName(String jobId) {
+        return "video-compression:" + jobId;
+    }
+
+    /** Best-effort: huỷ một work đã xong là no-op, không đáng để hỏng lời gọi cancel. */
+    private void cancelWork(String jobId) {
         try {
-            Intent intent = new Intent(getContext(), VideoCompressionService.class);
-            intent.setAction(action);
-            intent.putExtra(VideoCompressionService.EXTRA_JOB_ID, jobId);
-            getContext().startService(intent);
+            WorkManager.getInstance(getContext()).cancelUniqueWork(workName(jobId));
         } catch (Exception e) {
-            Log.w("NativeVideoCompressor", "Could not send " + action + " to service", e);
+            Log.w(TAG, "Could not cancel work for " + jobId, e);
         }
     }
 
@@ -295,7 +350,7 @@ public class NativeVideoCompressorPlugin extends Plugin {
                 partial.delete();
             }
         } catch (Exception e) {
-            Log.w("NativeVideoCompressor", "Could not delete cancelled output", e);
+            Log.w(TAG, "Could not delete cancelled output", e);
         }
     }
 }

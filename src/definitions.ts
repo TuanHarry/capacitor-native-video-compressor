@@ -41,6 +41,17 @@ export interface CancelResult {
 }
 
 export interface NativeVideoCompressorPlugin {
+  /**
+   * Compress one video and resolve with the path of the result.
+   *
+   * Android: the work runs inside a WorkManager worker, which keeps the
+   * process out of the frozen cached state while the user is away — there is
+   * no foreground service and no notification, because Google Play classes
+   * this use case as data sync plus local processing and rejects
+   * `FOREGROUND_SERVICE_MEDIA_PROCESSING` for it. WorkManager stops a worker
+   * after 10 minutes, so a compress that runs longer rejects with
+   * {@link CANCELLED}.
+   */
   compressVideo(options: CompressOptions): Promise<CompressResult>;
 
   /**
@@ -59,18 +70,5 @@ export interface NativeVideoCompressorPlugin {
   addListener(
     eventName: 'onProgress',
     listenerFunc: (info: { status: string; percent?: number }) => void,
-  ): Promise<PluginListenerHandle>;
-
-  /**
-   * Android: user đã bấm "Huỷ" trên notification của foreground service.
-   *
-   * Pha nén được plugin tự huỷ trước khi event này bắn, nhưng việc caller định
-   * làm với kết quả nén - upload chẳng hạn - thì không ai dừng hộ được, nên
-   * caller phải tự abort. Bỏ qua event này nghĩa là nút Huỷ không thật sự huỷ,
-   * và Play đánh trượt tiêu chí "can be terminated or stopped by the user".
-   */
-  addListener(
-    eventName: 'onCancelRequested',
-    listenerFunc: () => void,
   ): Promise<PluginListenerHandle>;
 }

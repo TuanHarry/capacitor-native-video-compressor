@@ -231,7 +231,6 @@ The `quality` parameter determines the output resolution and compression ratio. 
 * [`cancel(...)`](#cancel)
 * [`initialize()`](#initialize)
 * [`addListener('onProgress', ...)`](#addlisteneronprogress-)
-* [`addListener('onCancelRequested', ...)`](#addlisteneroncancelrequested-)
 * [Interfaces](#interfaces)
 
 </docgen-index>
@@ -244,6 +243,16 @@ The `quality` parameter determines the output resolution and compression ratio. 
 ```typescript
 compressVideo(options: CompressOptions) => Promise<CompressResult>
 ```
+
+Compress one video and resolve with the path of the result.
+
+Android: the work runs inside a WorkManager worker, which keeps the
+process out of the frozen cached state while the user is away — there is
+no foreground service and no notification, because Google Play classes
+this use case as data sync plus local processing and rejects
+`FOREGROUND_SERVICE_MEDIA_PROCESSING` for it. WorkManager stops a worker
+after 10 minutes, so a compress that runs longer rejects with
+{@link CANCELLED}.
 
 | Param         | Type                                                        |
 | ------------- | ----------------------------------------------------------- |
@@ -297,29 +306,6 @@ addListener(eventName: 'onProgress', listenerFunc: (info: { status: string; perc
 | ------------------ | --------------------------------------------------------------------- |
 | **`eventName`**    | <code>'onProgress'</code>                                             |
 | **`listenerFunc`** | <code>(info: { status: string; percent?: number; }) =&gt; void</code> |
-
-**Returns:** <code>Promise&lt;<a href="#pluginlistenerhandle">PluginListenerHandle</a>&gt;</code>
-
---------------------
-
-
-### addListener('onCancelRequested', ...)
-
-```typescript
-addListener(eventName: 'onCancelRequested', listenerFunc: () => void) => Promise<PluginListenerHandle>
-```
-
-Android: user đã bấm "Huỷ" trên notification của foreground service.
-
-Pha nén được plugin tự huỷ trước khi event này bắn, nhưng việc caller định
-làm với kết quả nén - upload chẳng hạn - thì không ai dừng hộ được, nên
-caller phải tự abort. Bỏ qua event này nghĩa là nút Huỷ không thật sự huỷ,
-và Play đánh trượt tiêu chí "can be terminated or stopped by the user".
-
-| Param              | Type                             |
-| ------------------ | -------------------------------- |
-| **`eventName`**    | <code>'onCancelRequested'</code> |
-| **`listenerFunc`** | <code>() =&gt; void</code>       |
 
 **Returns:** <code>Promise&lt;<a href="#pluginlistenerhandle">PluginListenerHandle</a>&gt;</code>
 

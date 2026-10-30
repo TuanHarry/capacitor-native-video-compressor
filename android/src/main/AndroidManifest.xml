@@ -1,20 +1,11 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <!-- Chỉ mediaProcessing: service sống đúng bằng pha nén, là use case duy
-         nhất ở đây thực sự chạy khi user rời app. Không khai dataSync nữa, vì
-         pha upload chạy bằng JS trong webview nên nó đứng lại ngay khi app
-         xuống nền - giữ foreground service cho nó là khai một việc không diễn
-         ra, và Play xét FGS theo use case chứ không theo số service.
+    <!-- Cố ý rỗng. Google Play xếp "nén rồi upload video do user chọn" vào data
+         sync + local processing chứ không phải media transcoding, nên
+         FOREGROUND_SERVICE_MEDIA_PROCESSING bị từ chối ở version code 32 kèm
+         yêu cầu chuyển sang WorkManager.
 
-         mediaProcessing chỉ có từ API 35, và ở đây không còn type nào để hạ
-         xuống, nên minSdk của plugin là 35 (xem android/build.gradle). -->
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROCESSING" />
-    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-
-    <application>
-        <service
-            android:name="com.atomic.videocompressor.VideoCompressionService"
-            android:foregroundServiceType="mediaProcessing"
-            android:exported="false" />
-    </application>
+         Pha nén giờ chạy trong VideoCompressionWorker, thứ WorkManager tự
+         quản lý - không service nào để khai, và mọi permission plugin từng
+         thêm vào app (FOREGROUND_SERVICE, FOREGROUND_SERVICE_MEDIA_PROCESSING,
+         POST_NOTIFICATIONS) đều đã gỡ. Đừng thêm lại. -->
 </manifest>
