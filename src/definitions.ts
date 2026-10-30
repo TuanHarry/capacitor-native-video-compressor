@@ -20,6 +20,17 @@ export interface CompressOptions {
    * without one, a cancel from either kills whatever the other is running.
    */
   jobId?: string;
+  /**
+   * Android only: keep the background worker alive after the compress ends,
+   * until `finishUpload({ jobId })` is called.
+   *
+   * The upload runs as JavaScript in the webview, and the moment the worker
+   * returns the process becomes cached and is frozen — measured on Android 16,
+   * an in-flight upload dies about five seconds later. Set this whenever the
+   * compressed file is about to be uploaded, and always pair it with a
+   * `finishUpload` in a `finally`.
+   */
+  holdForUpload?: boolean;
 }
 
 export interface CompressResult {
@@ -63,6 +74,16 @@ export interface NativeVideoCompressorPlugin {
    * thread (native), and none of them watch an AbortSignal.
    */
   cancel(options?: CancelOptions): Promise<CancelResult>;
+
+  /**
+   * Release the worker that `holdForUpload` kept alive for this job.
+   *
+   * Call it on every terminal branch of the upload, success or failure. A
+   * missed call leaves the device feeding an idle job until the hold expires.
+   * `released` is false when no job by that id was still being held, which is
+   * the normal outcome of a late or duplicate call, not an error.
+   */
+  finishUpload(options: { jobId: string }): Promise<{ released: boolean }>;
 
   initialize(): Promise<{ success: boolean; message?: string }>;
 

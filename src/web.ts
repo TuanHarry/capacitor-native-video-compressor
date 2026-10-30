@@ -102,6 +102,13 @@ export class NativeVideoCompressorWeb extends WebPlugin implements NativeVideoCo
     return { success: true, message: 'ready' };
   }
 
+  async finishUpload(): Promise<{ released: boolean }> {
+    // Nothing holds a process alive on the web — the tab either lives or the
+    // whole compress is gone with it. Resolving no-op so the one call site
+    // can fire unconditionally instead of branching on platform.
+    return { released: false };
+  }
+
   async compressVideo(options: CompressOptions): Promise<CompressResult> {
     this.currentJobId = options.jobId ?? 'default';
     this.cancelRequested = false;

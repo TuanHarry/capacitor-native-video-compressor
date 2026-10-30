@@ -21,10 +21,17 @@ import java.util.concurrent.ConcurrentHashMap;
  * Worker chỉ là vỏ bọc: việc nén thật do plugin đăng ký qua {@link #register}
  * ngay trước khi enqueue, vì chỉ plugin mới giữ được PluginCall để trả kết quả.
  *
- * Giới hạn phải biết: WorkManager dừng worker sau 10 phút. Quá mức đó
- * {@link #onStopped()} huỷ pha nén và caller nhận lỗi CANCELLED - đổi lại lấy
- * được một video dài hơn 10 phút nén xong thì phải có foreground service, thứ
- * không còn được phép ở đây.
+ * Với `holdForUpload`, worker ở lại sau khi nén xong cho tới khi caller gọi
+ * `finishUpload`. Pha upload chạy bằng JS trong webview, và khoảnh khắc worker
+ * kết thúc là khoảnh khắc process thành cached rồi bị đóng băng - đo trên
+ * Android 16: upload chết đúng ~5 giây sau khi worker trả về. Giữ worker sống
+ * xuyên pha upload là cách duy nhất còn lại để nó sống sót, vì foreground
+ * service đã bị Play cấm cho use case này.
+ *
+ * Giới hạn phải biết: WorkManager dừng worker sau 10 phút, tính chung cả nén
+ * lẫn upload. Quá mức đó {@link #onStopped()} huỷ việc đang chạy và caller
+ * nhận lỗi CANCELLED - đổi lại lấy được nhiều thời gian hơn thì phải có
+ * foreground service, thứ không còn được phép ở đây.
  */
 public class VideoCompressionWorker extends Worker {
 
@@ -40,11 +47,17 @@ public class VideoCompressionWorker extends Worker {
     private static final Map<String, Job> pending = new ConcurrentHashMap<>();
 
     interface Job {
-        /** Chạy pha nén và chỉ trả về khi nó đã kết thúc: xong, lỗi, hoặc huỷ. */
+        /**
+         * Chạy pha nén, và với holdForUpload thì ở lại tới khi caller gọi
+         * finishUpload. Chỉ trả về khi không còn gì phải giữ process sống.
+         */
         void run();
 
         /** WorkManager đòi dừng - hết 10 phút, hoặc work bị cancel. */
         void stop();
+
+        /** Caller báo đã upload xong; worker được phép kết thúc. */
+        void release();
     }
 
     static void register(String jobId, Job job) {
@@ -53,6 +66,19 @@ public class VideoCompressionWorker extends Worker {
 
     static void unregister(String jobId) {
         pending.remove(jobId);
+    }
+
+    /**
+     * Thả worker đang giữ process sống cho pha upload của jobId.
+     *
+     * False khi không còn job nào mang id đó - worker đã kết thúc từ trước,
+     * không có gì để thả. Đó là trạng thái bình thường, không phải lỗi.
+     */
+    static boolean release(String jobId) {
+        Job job = pending.get(jobId);
+        if (job == null) return false;
+        job.release();
+        return true;
     }
 
     @Nullable

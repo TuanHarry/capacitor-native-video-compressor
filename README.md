@@ -229,6 +229,7 @@ The `quality` parameter determines the output resolution and compression ratio. 
 
 * [`compressVideo(...)`](#compressvideo)
 * [`cancel(...)`](#cancel)
+* [`finishUpload(...)`](#finishupload)
 * [`initialize()`](#initialize)
 * [`addListener('onProgress', ...)`](#addlisteneronprogress-)
 * [Interfaces](#interfaces)
@@ -285,6 +286,28 @@ thread (native), and none of them watch an AbortSignal.
 --------------------
 
 
+### finishUpload(...)
+
+```typescript
+finishUpload(options: { jobId: string; }) => Promise<{ released: boolean; }>
+```
+
+Release the worker that `holdForUpload` kept alive for this job.
+
+Call it on every terminal branch of the upload, success or failure. A
+missed call leaves the device feeding an idle job until the hold expires.
+`released` is false when no job by that id was still being held, which is
+the normal outcome of a late or duplicate call, not an error.
+
+| Param         | Type                            |
+| ------------- | ------------------------------- |
+| **`options`** | <code>{ jobId: string; }</code> |
+
+**Returns:** <code>Promise&lt;{ released: boolean; }&gt;</code>
+
+--------------------
+
+
 ### initialize()
 
 ```typescript
@@ -325,12 +348,13 @@ addListener(eventName: 'onProgress', listenerFunc: (info: { status: string; perc
 
 #### CompressOptions
 
-| Prop             | Type                                                                            | Description                                                                                                                                                                                                                                                                                                                                              |
-| ---------------- | ------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **`sourcePath`** | <code>string</code>                                                             |                                                                                                                                                                                                                                                                                                                                                          |
-| **`destPath`**   | <code>string</code>                                                             |                                                                                                                                                                                                                                                                                                                                                          |
-| **`quality`**    | <code>'VERY_HIGH' \| 'HIGH' \| 'MEDIUM' \| 'LOW' \| 'VERY_LOW' \| '360P'</code> |                                                                                                                                                                                                                                                                                                                                                          |
-| **`jobId`**      | <code>string</code>                                                             | Names this compress so `cancel({ jobId })` can target it. Every platform compresses one video at a time, so cancellation is global by nature. Two independent callers in the same app (say a comment queue and a notes queue) therefore need a way to say *which* job they mean — without one, a cancel from either kills whatever the other is running. |
+| Prop                | Type                                                                            | Description                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| ------------------- | ------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **`sourcePath`**    | <code>string</code>                                                             |                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| **`destPath`**      | <code>string</code>                                                             |                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| **`quality`**       | <code>'VERY_HIGH' \| 'HIGH' \| 'MEDIUM' \| 'LOW' \| 'VERY_LOW' \| '360P'</code> |                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| **`jobId`**         | <code>string</code>                                                             | Names this compress so `cancel({ jobId })` can target it. Every platform compresses one video at a time, so cancellation is global by nature. Two independent callers in the same app (say a comment queue and a notes queue) therefore need a way to say *which* job they mean — without one, a cancel from either kills whatever the other is running.                                                                                         |
+| **`holdForUpload`** | <code>boolean</code>                                                            | Android only: keep the background worker alive after the compress ends, until `finishUpload({ jobId })` is called. The upload runs as JavaScript in the webview, and the moment the worker returns the process becomes cached and is frozen — measured on Android 16, an in-flight upload dies about five seconds later. Set this whenever the compressed file is about to be uploaded, and always pair it with a `finishUpload` in a `finally`. |
 
 
 #### CancelResult

@@ -22,6 +22,7 @@ import java.io.File;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 @CapacitorPlugin(name = "NativeVideoCompressor")
@@ -36,6 +37,12 @@ public class NativeVideoCompressorPlugin extends Plugin {
     private static final String CANCELLED_CODE = "CANCELLED";
 
     private static final String STORAGE_SUBFOLDER = "compressed_videos";
+
+    /**
+     * Trần cho pha giữ-chờ-upload. Ngắn hơn mốc 10 phút mà WorkManager tự cắt,
+     * để một caller chết giữa chừng không chiếm quota job tới tận phút cuối.
+     */
+    private static final long HOLD_FOR_UPLOAD_TIMEOUT_MINUTES = 8;
 
     /** The job compressVideo is running right now, for cancel({ jobId }). */
     private String currentJobId = null;
@@ -81,6 +88,21 @@ public class NativeVideoCompressorPlugin extends Plugin {
         }
 
         ret.put("cancelled", cancelled);
+        call.resolve(ret);
+    }
+
+    /**
+     * Caller báo đã xong việc với kết quả nén - thường là upload xong - nên
+     * worker đang giữ process sống được phép kết thúc.
+     *
+     * Phải gọi trên MỌI nhánh kết thúc của pha upload, kể cả nhánh lỗi. Bỏ sót
+     * một nhánh nghĩa là máy phải nuôi một job rỗng tới khi hết hạn giữ.
+     */
+    @PluginMethod
+    public void finishUpload(PluginCall call) {
+        String jobId = call.getString("jobId");
+        JSObject ret = new JSObject();
+        ret.put("released", jobId != null && VideoCompressionWorker.release(jobId));
         call.resolve(ret);
     }
 
@@ -151,7 +173,8 @@ public class NativeVideoCompressorPlugin extends Plugin {
         // thường bị đóng băng cùng process ngay khi user rời app, còn process
         // đang chạy worker thì không. Đây là phương án Google Play chỉ đích
         // danh khi từ chối foreground service ở version code 32.
-        CompressionJob job = new CompressionJob(jobId, srcUri, fileName, configuration, storageConfig, call);
+        boolean holdForUpload = Boolean.TRUE.equals(call.getBoolean("holdForUpload", false));
+        CompressionJob job = new CompressionJob(jobId, srcUri, fileName, configuration, storageConfig, call, holdForUpload);
         VideoCompressionWorker.register(jobId, job);
 
         OneTimeWorkRequest request = new OneTimeWorkRequest.Builder(VideoCompressionWorker.class)
@@ -183,12 +206,19 @@ public class NativeVideoCompressorPlugin extends Plugin {
         private final Configuration configuration;
         private final AppSpecificStorageConfiguration storageConfig;
         private final PluginCall call;
+        private final boolean holdForUpload;
 
         /** Mở khi pha nén kết thúc, để worker biết lúc nào được trả về. */
         private final CountDownLatch done = new CountDownLatch(1);
 
+        /** Mở khi caller gọi finishUpload - chỉ dùng khi holdForUpload. */
+        private final CountDownLatch released = new CountDownLatch(1);
+
         /** Chốt một-lần cho mọi nhánh kết thúc; PluginCall chỉ được trả lời một lần. */
         private final AtomicBoolean delivered = new AtomicBoolean(false);
+
+        /** True khi nén xong có kết quả dùng được, tức là có cái để upload. */
+        private volatile boolean compressed = false;
 
         private boolean started = false;
         private boolean stopped = false;
@@ -199,7 +229,8 @@ public class NativeVideoCompressorPlugin extends Plugin {
             String fileName,
             Configuration configuration,
             AppSpecificStorageConfiguration storageConfig,
-            PluginCall call
+            PluginCall call,
+            boolean holdForUpload
         ) {
             this.jobId = jobId;
             this.srcUri = srcUri;
@@ -207,6 +238,7 @@ public class NativeVideoCompressorPlugin extends Plugin {
             this.configuration = configuration;
             this.storageConfig = storageConfig;
             this.call = call;
+            this.holdForUpload = holdForUpload;
         }
 
         @Override
@@ -238,7 +270,26 @@ public class NativeVideoCompressorPlugin extends Plugin {
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 deliverCancelled();
+                return;
             }
+
+            // Nén hỏng hoặc bị huỷ thì không có gì để upload - về ngay thay vì
+            // giữ process sống chờ một finishUpload không bao giờ tới.
+            if (!holdForUpload || !compressed) return;
+
+            try {
+                // Có hạn chứ không chờ vô tận: nếu caller chết giữa pha upload
+                // mà không gọi finishUpload, worker sẽ treo tới khi WorkManager
+                // cắt ở phút thứ 10. Về sớm hơn để trả quota job lại cho máy.
+                released.await(HOLD_FOR_UPLOAD_TIMEOUT_MINUTES, TimeUnit.MINUTES);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+
+        @Override
+        public void release() {
+            released.countDown();
         }
 
         @Override
@@ -249,6 +300,10 @@ public class NativeVideoCompressorPlugin extends Plugin {
                 stopped = true;
                 wasRunning = started;
             }
+
+            // Trước mọi thứ khác: worker đang bị cắt, đừng để run() còn ngồi
+            // chờ finishUpload nữa.
+            released.countDown();
 
             if (wasRunning) {
                 // onCancelled của LightCompressor sẽ mở chốt; không tự gọi
@@ -284,6 +339,10 @@ public class NativeVideoCompressorPlugin extends Plugin {
 
                 @Override
                 public void onSuccess(int i, long l, @Nullable String s) {
+                    // Phải đặt TRƯỚC claim(): claim() mở chốt `done`, và run()
+                    // đọc `compressed` ngay khi chốt đó mở để quyết định có ở
+                    // lại chờ upload hay không.
+                    compressed = s != null;
                     if (!claim()) return;
                     // Nén xong, trả kết quả đường dẫn file mới về cho JS
                     JSObject ret = new JSObject();
