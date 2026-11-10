@@ -174,10 +174,13 @@ public class NativeVideoCompressorPlugin: CAPPlugin, CAPBridgedPlugin {
             let outputHeight = isNaturalPortrait ? max(boundingWidth, boundingHeight) : min(boundingWidth, boundingHeight)
             
             // --- CẤU HÌNH VIDEO ---
+            // Decoder and H.264 encoder both work in YUV 4:2:0; asking for BGRA cost two colour conversions per frame.
             let videoOutputSettings: [String: Any] = [
-                kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA)
+                kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
             ]
             let videoOutput = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: videoOutputSettings)
+            // Each buffer goes straight to the writer and is never mutated, so the per-sample copy is wasted work.
+            videoOutput.alwaysCopiesSampleData = false
             if reader.canAdd(videoOutput) { reader.add(videoOutput) }
             
             let videoInputSettings:[String: Any] = [
@@ -200,6 +203,7 @@ public class NativeVideoCompressorPlugin: CAPPlugin, CAPBridgedPlugin {
             if let audioTrack = audioTrack {
                 let audioOutputSettings:[String: Any] = [AVFormatIDKey: kAudioFormatLinearPCM]
                 audioOutput = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: audioOutputSettings)
+                audioOutput!.alwaysCopiesSampleData = false
                 if reader.canAdd(audioOutput!) { reader.add(audioOutput!) }
                 
                 let audioInputSettings:[String: Any] = [
