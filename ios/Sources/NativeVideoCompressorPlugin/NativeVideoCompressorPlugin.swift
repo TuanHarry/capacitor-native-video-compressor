@@ -202,9 +202,10 @@ public class NativeVideoCompressorPlugin: CAPPlugin, CAPBridgedPlugin {
             
             if let audioTrack = audioTrack {
                 let audioOutputSettings:[String: Any] = [AVFormatIDKey: kAudioFormatLinearPCM]
-                audioOutput = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: audioOutputSettings)
-                audioOutput!.alwaysCopiesSampleData = false
-                if reader.canAdd(audioOutput!) { reader.add(audioOutput!) }
+                let output = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: audioOutputSettings)
+                output.alwaysCopiesSampleData = false
+                if reader.canAdd(output) { reader.add(output) }
+                audioOutput = output
                 
                 let audioInputSettings:[String: Any] = [
                     AVFormatIDKey: kAudioFormatMPEG4AAC,

@@ -9,9 +9,10 @@ export const CANCELLED = 'CANCELLED';
 
 /**
  * `code` on the error `compressVideo` rejects with on web when WebCodecs can't
- * encode the video and it is larger than {@link MAX_FFMPEG_INPUT_BYTES}.
- * ffmpeg.wasm copies the whole input into wasm memory (~2 GB ceiling), so a
- * large file there crashes or hangs the tab rather than failing cleanly.
+ * encode the video and it is larger than 200 MB, the cap for the ffmpeg.wasm
+ * fallback. ffmpeg.wasm copies the whole input into wasm memory (~2 GB
+ * ceiling), so a large file there crashes or hangs the tab rather than failing
+ * cleanly.
  */
 export const TOO_LARGE_FOR_WEB = 'TOO_LARGE_FOR_WEB';
 
@@ -21,9 +22,6 @@ export const TOO_LARGE_FOR_WEB = 'TOO_LARGE_FOR_WEB';
  * is freed.
  */
 export const STORAGE_FULL = 'STORAGE_FULL';
-
-/** Largest input the web build hands to its ffmpeg.wasm fallback. */
-export const MAX_FFMPEG_INPUT_BYTES = 200 * 1024 * 1024;
 
 export interface CompressOptions {
   sourcePath: string;

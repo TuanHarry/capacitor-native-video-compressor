@@ -22,60 +22,65 @@ import type {
   CancelOptions,
   CancelResult,
 } from './definitions';
-import { CANCELLED, MAX_FFMPEG_INPUT_BYTES, STORAGE_FULL, TOO_LARGE_FOR_WEB } from './definitions';
+import { CANCELLED, STORAGE_FULL, TOO_LARGE_FOR_WEB } from './definitions';
+import { createOpfsOutput } from './opfs-output';
 
 type VideoQuality = NonNullable<CompressOptions['quality']>;
 
 /**
- * Rejection shape for a cancelled compress. `code` matches what `call.reject`
+ * Rejection shape for every coded failure. `code` matches what `call.reject`
  * puts on the error object on iOS/Android, so one `error.code === 'CANCELLED'`
- * check works on every platform — and on both web engines below.
+ * check works on every platform and on both web engines below.
  */
-class CancelledError extends Error {
-  code = CANCELLED;
-  constructor() {
-    super('Đã hủy nén');
-    this.name = 'CancelledError';
+class CompressError extends Error {
+  constructor(
+    public code: string,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'CompressError';
   }
 }
 
-class TooLargeForWebError extends Error {
-  code = TOO_LARGE_FOR_WEB;
-  constructor() {
-    super('Video quá lớn để nén trên trình duyệt này');
-    this.name = 'TooLargeForWebError';
-  }
-}
+const cancelledError = () => new CompressError(CANCELLED, 'Đã hủy nén');
 
-class StorageFullError extends Error {
-  code = STORAGE_FULL;
-  constructor() {
-    super('Không đủ dung lượng lưu trữ để nén video');
-    this.name = 'StorageFullError';
-  }
-}
+const isQuotaError = (e: unknown): boolean => {
+  const { name, cause } = (e ?? {}) as { name?: unknown; cause?: unknown };
+  return name === 'QuotaExceededError' || (!!cause && isQuotaError(cause));
+};
 
-const isQuotaError = (e: any): boolean =>
-  e?.name === 'QuotaExceededError' || (!!e?.cause && isQuotaError(e.cause));
+/** ffmpeg.wasm copies the whole input into wasm memory (~2 GB ceiling). */
+const MAX_FFMPEG_INPUT_BYTES = 200 * 1024 * 1024;
 
 /**
- * WebCodecs target per quality tier: cap height + a bitrate ceiling. The
- * quantizer (constant 26, CRF-like) drives quality where the encoder honours
- * it; H.264 on most browsers is bitrate-driven, so `bitrate` is the real knob.
- * fps is capped to 30 at call time (never upsampled). Audio is left to
- * mediabunny, which re-encodes to AAC for the MP4 container.
+ * Per quality tier. WebCodecs: cap height + a bitrate ceiling; the quantizer
+ * (constant 26, CRF-like) drives quality where the encoder honours it, but
+ * H.264 on most browsers is bitrate-driven, so `bitrate` is the real knob.
+ * ffmpeg: same height, `crf` and `audioBitrate`. fps is capped to 30 at call
+ * time (never upsampled). On WebCodecs audio is left to mediabunny, which
+ * re-encodes to AAC for the MP4 container.
  */
-const WEBCODECS_LADDER: Record<VideoQuality, { height: number; bitrate: number }> = {
-  VERY_HIGH: { height: 1080, bitrate: 4000000 },
-  HIGH: { height: 720, bitrate: 2000000 },
-  MEDIUM: { height: 540, bitrate: 1200000 },
-  LOW: { height: 480, bitrate: 1000000 },
-  '360P': { height: 360, bitrate: 700000 },
-  VERY_LOW: { height: 240, bitrate: 350000 },
+const QUALITY_LADDER: Record<VideoQuality, { height: number; bitrate: number; crf: number; audioBitrate: string }> = {
+  VERY_HIGH: { height: 1080, bitrate: 4000000, crf: 23, audioBitrate: '128k' },
+  HIGH: { height: 720, bitrate: 2000000, crf: 28, audioBitrate: '128k' },
+  MEDIUM: { height: 540, bitrate: 1200000, crf: 30, audioBitrate: '96k' },
+  LOW: { height: 480, bitrate: 1000000, crf: 32, audioBitrate: '96k' },
+  '360P': { height: 360, bitrate: 700000, crf: 28, audioBitrate: '64k' },
+  VERY_LOW: { height: 240, bitrate: 350000, crf: 35, audioBitrate: '48k' },
 };
 
 const WEBCODECS_QUANTIZER = 26;
 const FPS_CAP = 30;
+
+// Cap fps at 30, but never upsample. A failed probe leaves the source rate untouched.
+const probeFrameRate = async (input: Input): Promise<number | undefined> => {
+  try {
+    const stats = await (await input.getPrimaryVideoTrack())?.computePacketStats(100);
+    return stats && stats.averagePacketRate > 0 ? Math.min(FPS_CAP, Math.round(stats.averagePacketRate)) : undefined;
+  } catch {
+    return undefined;
+  }
+};
 
 const CORE_BASE_URL = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm';
 
@@ -105,108 +110,17 @@ const loadCoreURLs = () => {
   return corePromise;
 };
 
-/**
- * WebCodecs output goes to the origin private file system so a long video
- * never sits whole in memory. The File handed back stays readable only while
- * its OPFS entry exists, and callers keep it well past `compressVideo` (until
- * the upload is done, or longer for a retry), so a successful output is never
- * deleted by this tab. Each tab writes under its own directory and holds a Web
- * Lock named after it for its whole life; every compress removes the
- * directories whose lock nobody holds any more, i.e. those of closed tabs.
- * A failed or cancelled job deletes its own file straight away.
- *
- * ponytail: outputs live until the tab closes. Upgrade path: an explicit
- * release call from the caller once it no longer needs the File.
- */
-const OPFS_ROOT = 'native-video-compressor';
-const TAB_ID = typeof crypto !== 'undefined' && 'randomUUID' in crypto ? crypto.randomUUID() : String(Date.now());
-const lockName = (tabId: string) => `${OPFS_ROOT}:${tabId}`;
-let tabDirsPromise: Promise<{ base: FileSystemDirectoryHandle; dir: FileSystemDirectoryHandle }> | null = null;
-
-// A rejected request (e.g. a sandboxed iframe) rejects here, so openTabDirs
-// fails and the caller buffers in memory instead of waiting forever.
-const holdTabLock = () =>
-  new Promise<void>((granted, rejected) => {
-    navigator.locks
-      .request(lockName(TAB_ID), () => {
-        granted();
-        return new Promise<never>(() => undefined);
-      })
-      .catch(rejected);
-  });
-
-const sweepClosedTabs = async (base: FileSystemDirectoryHandle) => {
-  // Names first, locks second: a tab that creates its directory between the two
-  // reads already holds its lock, so it is never mistaken for a closed one.
-  const names: string[] = [];
-  const keys: AsyncIterator<string> = (base as any).keys();
-  for (let next = await keys.next(); !next.done; next = await keys.next()) names.push(next.value);
-  const { held = [] } = await navigator.locks.query();
-  const live = new Set(held.map((l) => l.name));
-  for (const name of names) {
-    if (!live.has(lockName(name))) await base.removeEntry(name, { recursive: true }).catch(() => undefined);
-  }
-};
-
-const openTabDirs = async () => {
-  const base = await (await navigator.storage.getDirectory()).getDirectoryHandle(OPFS_ROOT, { create: true });
-  if (navigator.locks) await holdTabLock();
-  return { base, dir: await base.getDirectoryHandle(TAB_ID, { create: true }) };
-};
-
-interface OpfsOutput {
-  writable: FileSystemWritableFileStream;
-  read: () => Promise<File>;
-  discard: () => Promise<void>;
-}
-
-/** Null when OPFS or `createWritable` (missing on Safari's main thread) isn't there. */
-const createOpfsOutput = async (): Promise<OpfsOutput | null> => {
-  try {
-    if (typeof navigator === 'undefined' || !navigator.storage?.getDirectory) return null;
-    const { base, dir } = await (tabDirsPromise ??= openTabDirs().catch((e) => {
-      tabDirsPromise = null;
-      throw e;
-    }));
-    // Without Web Locks another tab's live files can't be told apart: no sweep.
-    if (navigator.locks) await sweepClosedTabs(base).catch(() => undefined);
-    const name = `${crypto.randomUUID()}.mp4`;
-    const handle = await dir.getFileHandle(name, { create: true }).catch((e) => {
-      // The directory was removed under us (site data cleared): reopen it next time.
-      if (e?.name === 'NotFoundError') tabDirsPromise = null;
-      throw e;
-    });
-    if (typeof handle.createWritable !== 'function') {
-      await dir.removeEntry(name).catch(() => undefined);
-      return null;
-    }
-    const writable = await handle.createWritable();
-    const discard = async () => {
-      // Rejects harmlessly once mediabunny holds the writer; it closes it then.
-      await writable.abort().catch(() => undefined);
-      await dir.removeEntry(name).catch(() => undefined);
-    };
-    return { writable, read: () => handle.getFile(), discard };
-  } catch (e) {
-    console.warn('[compress] OPFS unavailable, buffering output in memory:', e);
-    return null;
-  }
-};
-
 export class NativeVideoCompressorWeb extends WebPlugin implements NativeVideoCompressorPlugin {
   private ffmpeg: FFmpeg | null = null;
   private isLoaded = false;
   /** The mediabunny conversion running now, so `cancel()` can abort it. */
   private activeConversion: Conversion | null = null;
-  /** The job `compressVideo` is running right now, for `cancel({ jobId })`. */
-  private currentJobId: string | null = null;
+  /** The job `compressVideo` is running right now; a fresh object per call, so two calls never look alike. */
+  private currentJob: { id: string } | null = null;
   private cancelRequested = false;
 
   async initialize(): Promise<{ success: boolean; message?: string }> {
-    // WebCodecs (the primary path) needs no core download, so there is nothing
-    // to warm. Eagerly loading the ffmpeg core here would pull ~30 MB for a
-    // path most compresses never take. The fallback lazy-loads its core on
-    // first use. Kept as a resolving no-op so callers that await it still pass.
+    // No-op: preloading the ~30 MB ffmpeg core would cost most compresses a download they never use.
     return { success: true, message: 'ready' };
   }
 
@@ -218,20 +132,20 @@ export class NativeVideoCompressorWeb extends WebPlugin implements NativeVideoCo
   }
 
   async compressVideo(options: CompressOptions): Promise<CompressResult> {
-    const jobId = options.jobId ?? 'default';
-    this.currentJobId = jobId;
+    const job = { id: options.jobId ?? 'default' };
+    this.currentJob = job;
     this.cancelRequested = false;
     // A job the caller gave up on (e.g. a stall timeout) runs on until its next
     // await returns. Once another job has started, the shared flags above speak
     // for that job, not this one, so a superseded job counts as cancelled.
-    const isSuperseded = () => this.currentJobId !== jobId;
+    const isSuperseded = () => this.currentJob !== job;
 
     // Checked at every stage boundary, not just around the encode: cancelling
     // an engine only reaches work already handed to it, so a cancel during the
     // source fetch or before init has nothing to interrupt and would otherwise
     // let the compress carry on as if nothing had happened.
     const throwIfCancelled = () => {
-      if (this.cancelRequested || isSuperseded()) throw new CancelledError();
+      if (this.cancelRequested || isSuperseded()) throw cancelledError();
     };
 
     try {
@@ -246,18 +160,17 @@ export class NativeVideoCompressorWeb extends WebPlugin implements NativeVideoCo
         try {
           const result = await this.compressWithWebCodecs(blob, quality, throwIfCancelled);
           if (result) return result;
-          // null → conversion invalid / tracks discarded → fall back to ffmpeg.
         } catch (e: any) {
           if (e?.code === CANCELLED) throw e; // user cancel: never fall back
-          // ffmpeg.wasm would need even more room; and its size cap would misreport this as TOO_LARGE_FOR_WEB.
-          if (isQuotaError(e)) throw new StorageFullError();
+          // Not to ffmpeg either: it needs even more room, and its size cap would misreport this as TOO_LARGE_FOR_WEB.
+          if (isQuotaError(e)) throw new CompressError(STORAGE_FULL, 'Không đủ dung lượng lưu trữ để nén video');
           console.warn('[compress] WebCodecs failed, falling back to ffmpeg:', e);
-          throwIfCancelled();
         }
       }
 
       throwIfCancelled();
-      if (blob.size > MAX_FFMPEG_INPUT_BYTES) throw new TooLargeForWebError();
+      if (blob.size > MAX_FFMPEG_INPUT_BYTES)
+        throw new CompressError(TOO_LARGE_FOR_WEB, 'Video quá lớn để nén trên trình duyệt này');
       return await this.compressWithFfmpeg(blob, quality, throwIfCancelled);
     } catch (error: any) {
       if (error?.code === CANCELLED) {
@@ -268,7 +181,7 @@ export class NativeVideoCompressorWeb extends WebPlugin implements NativeVideoCo
       throw error;
     } finally {
       if (!isSuperseded()) {
-        this.currentJobId = null;
+        this.currentJob = null;
         this.cancelRequested = false;
         this.activeConversion = null;
       }
@@ -280,15 +193,15 @@ export class NativeVideoCompressorWeb extends WebPlugin implements NativeVideoCo
    * so acting on both is safe.
    *
    * WebCodecs: `conversion.cancel()` makes the in-flight `execute()` reject
-   * with `ConversionCanceledError`, surfaced as a `CancelledError` below.
+   * with `ConversionCanceledError`, surfaced as a CANCELLED `CompressError` below.
    * ffmpeg: `exec()` runs synchronously inside the worker and never reaches a
    * message poll while encoding, so `worker.terminate()` is the only way to
    * stop it — its cost is the loaded core, which is why the core URLs are
    * cached above.
    */
   async cancel(options?: CancelOptions): Promise<CancelResult> {
-    if (!this.currentJobId) return { cancelled: false };
-    if (options?.jobId && options.jobId !== this.currentJobId) return { cancelled: false };
+    if (!this.currentJob) return { cancelled: false };
+    if (options?.jobId && options.jobId !== this.currentJob.id) return { cancelled: false };
 
     // Set even when neither engine exists yet: the job may still be fetching
     // the source or inside loadFFmpeg, which read this flag at their boundaries.
@@ -296,7 +209,7 @@ export class NativeVideoCompressorWeb extends WebPlugin implements NativeVideoCo
 
     const conversion = this.activeConversion;
     this.activeConversion = null;
-    // Fire-and-forget: the CancelledError surfaces from the execute() rejection,
+    // Fire-and-forget: the CANCELLED error surfaces from the execute() rejection,
     // not from here; awaiting would only make cancel() slower.
     conversion?.cancel().catch(() => undefined);
 
@@ -319,7 +232,7 @@ export class NativeVideoCompressorWeb extends WebPlugin implements NativeVideoCo
 
   private async canUseWebCodecs(quality: VideoQuality): Promise<boolean> {
     try {
-      const { bitrate } = WEBCODECS_LADDER[quality];
+      const { bitrate } = QUALITY_LADDER[quality];
       return await canEncodeVideo('avc', {
         hardwareAcceleration: 'no-preference',
         quality: new Quality({ quantizer: WEBCODECS_QUANTIZER, bitrate }),
@@ -334,39 +247,33 @@ export class NativeVideoCompressorWeb extends WebPlugin implements NativeVideoCo
     quality: VideoQuality,
     throwIfCancelled: () => void,
   ): Promise<CompressResult | null> {
-    const { height, bitrate } = WEBCODECS_LADDER[quality];
-
     const opfs = await createOpfsOutput();
     console.log(`[compress] engine=webcodecs target=${opfs ? 'opfs' : 'buffer'}`);
-    const input = new Input({ formats: ALL_FORMATS, source: new BlobSource(blob) });
-    const output = new Output({
-      format: new Mp4OutputFormat(),
-      target: opfs ? new StreamTarget(opfs.writable, { chunked: true }) : new BufferTarget(),
-    });
-
-    // Closes the writable, which otherwise keeps the entry locked against removal.
-    const abandon = async () => {
-      await output.cancel().catch(() => undefined);
-      await opfs?.discard();
-    };
+    let output: Output | undefined;
+    let kept = false;
     try {
-      if (!(await this.runConversion(input, output, height, bitrate, throwIfCancelled))) {
-        await abandon();
-        return null;
-      }
+      const input = new Input({ formats: ALL_FORMATS, source: new BlobSource(blob) });
+      output = new Output({
+        format: new Mp4OutputFormat(),
+        target: opfs ? new StreamTarget(opfs.writable, { chunked: true }) : new BufferTarget(),
+      });
+      if (!(await this.runConversion(input, output, QUALITY_LADDER[quality], throwIfCancelled))) return null;
       let outBlob: Blob;
       if (opfs) {
-        // OPFS files carry no MIME type, and callers derive the extension from it.
-        outBlob = (await opfs.read()).slice(0, undefined, 'video/mp4');
+        outBlob = await opfs.read();
       } else {
         const buffer = (output.target as BufferTarget).buffer;
         if (!buffer) throw new Error('WebCodecs produced no output');
         outBlob = new Blob([buffer], { type: 'video/mp4' });
       }
+      kept = true;
       return { success: true, destPath: URL.createObjectURL(outBlob) };
-    } catch (e) {
-      await abandon();
-      throw e;
+    } finally {
+      if (!kept) {
+        // Closes the writable first, which otherwise keeps the entry locked against removal.
+        await output?.cancel().catch(() => undefined);
+        await opfs?.discard();
+      }
     }
   }
 
@@ -374,25 +281,10 @@ export class NativeVideoCompressorWeb extends WebPlugin implements NativeVideoCo
   private async runConversion(
     input: Input,
     output: Output,
-    height: number,
-    bitrate: number,
+    { height, bitrate }: { height: number; bitrate: number },
     throwIfCancelled: () => void,
   ): Promise<boolean> {
-    // Cap fps at 30, but never upsample: probe the source and take the min.
-    // A failed probe just omits frameRate, leaving the source rate untouched.
-    let frameRate: number | undefined;
-    try {
-      const track = await input.getPrimaryVideoTrack();
-      if (track) {
-        const stats = await track.computePacketStats(100);
-        if (stats.averagePacketRate > 0) {
-          frameRate = Math.min(FPS_CAP, Math.round(stats.averagePacketRate));
-        }
-      }
-    } catch {
-      frameRate = undefined;
-    }
-
+    const frameRate = await probeFrameRate(input);
     throwIfCancelled();
 
     const conversion = await Conversion.init({
@@ -408,7 +300,7 @@ export class NativeVideoCompressorWeb extends WebPlugin implements NativeVideoCo
         hardwareAcceleration: 'no-preference',
         ...(frameRate ? { frameRate } : {}),
       },
-      // The default copies the input's title/description/comment; phone videos can carry identifying text there.
+      // The default copies the input's raw udta metadata tags, GPS location included.
       tags: {},
     });
 
@@ -429,11 +321,10 @@ export class NativeVideoCompressorWeb extends WebPlugin implements NativeVideoCo
         this.notifyListeners('onProgress', { status: 'progress', percent: Math.round(progress * 100) });
     };
 
-    throwIfCancelled();
     try {
       await conversion.execute();
     } catch (e: any) {
-      if (this.cancelRequested || e instanceof ConversionCanceledError) throw new CancelledError();
+      if (this.cancelRequested || e instanceof ConversionCanceledError) throw cancelledError();
       throw e;
     }
     throwIfCancelled();
@@ -446,12 +337,7 @@ export class NativeVideoCompressorWeb extends WebPlugin implements NativeVideoCo
 
     this.notifyListeners('onProgress', { status: 'loading_core', percent: 0 });
 
-    // Built on a local, published to the field only once it is ready and still
-    // wanted. Assigning `this.ffmpeg` up front and setting `isLoaded` after the
-    // await left a window where a cancel could null the instance and the load,
-    // finishing a moment later, would set `isLoaded = true` on nothing at all —
-    // after which every compressVideo threw 'FFmpeg failed to load' for the
-    // rest of the page's life.
+    // Published only once loaded and still wanted, so a cancel mid-load can't leave `isLoaded` set on a dropped instance.
     const instance = new FFmpeg();
 
     instance.on('progress', ({ progress }) => {
@@ -501,7 +387,7 @@ export class NativeVideoCompressorWeb extends WebPlugin implements NativeVideoCo
     }
     // Bound once. `this.ffmpeg` is nulled by cancel(), so reading it after any
     // of the awaits below can hand back null on a reference the compiler
-    // narrowed here — surfacing a cancel as a TypeError, not a CancelledError.
+    // narrowed here — surfacing a cancel as a TypeError, not a CANCELLED error.
     const ffmpeg = this.ffmpeg;
 
     console.log('[compress] engine=ffmpeg');
@@ -510,42 +396,7 @@ export class NativeVideoCompressorWeb extends WebPlugin implements NativeVideoCo
     const inputFileName = 'input.mp4';
     const outputFileName = 'output.mp4';
 
-    let crf = '28';
-    let scale = '';
-    let audioBitrate = '128k';
-
-    switch (quality) {
-      case 'VERY_HIGH':
-        crf = '23';
-        scale = '-vf scale=-2:1080';
-        audioBitrate = '128k';
-        break;
-      case 'HIGH':
-        crf = '28';
-        scale = '-vf scale=-2:720';
-        audioBitrate = '128k';
-        break;
-      case 'MEDIUM':
-        crf = '30';
-        scale = '-vf scale=-2:540';
-        audioBitrate = '96k';
-        break;
-      case 'LOW':
-        crf = '32';
-        scale = '-vf scale=-2:480';
-        audioBitrate = '96k';
-        break;
-      case '360P':
-        crf = '28';
-        scale = '-vf scale=-2:360';
-        audioBitrate = '64k';
-        break;
-      case 'VERY_LOW':
-        crf = '35';
-        scale = '-vf scale=-2:240';
-        audioBitrate = '48k';
-        break;
-    }
+    const { height, crf, audioBitrate } = QUALITY_LADDER[quality];
 
     const inputData = new Uint8Array(await blob.arrayBuffer());
 
@@ -559,13 +410,14 @@ export class NativeVideoCompressorWeb extends WebPlugin implements NativeVideoCo
     throwIfCancelled();
 
     // ffmpeg copies global metadata by default, including the GPS location (©xyz / loci).
-    const args: string[] = ['-i', inputFileName, '-map_metadata', '-1'];
-    args.push('-c:v', 'libx264', '-preset', 'superfast', '-crf', crf);
-    if (scale) {
-      args.push(...scale.split(' '));
-    }
-    args.push('-c:a', 'aac', '-b:a', audioBitrate);
-    args.push(outputFileName);
+    // prettier-ignore
+    const args = [
+      '-i', inputFileName, '-map_metadata', '-1',
+      '-c:v', 'libx264', '-preset', 'superfast', '-crf', String(crf),
+      '-vf', `scale=-2:${height}`,
+      '-c:a', 'aac', '-b:a', audioBitrate,
+      outputFileName,
+    ];
 
     try {
       await ffmpeg.exec(args);

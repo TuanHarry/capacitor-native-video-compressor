@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mb = vi.hoisted(() => ({
   outputs: [] as any[],
@@ -31,20 +31,25 @@ vi.mock('mediabunny', () => ({
   BufferTarget: class {
     buffer = new ArrayBuffer(1);
   },
-  StreamTarget: class {},
+  // Like the real one, takes over the writable: only the Output can close it from here on.
+  StreamTarget: class {
+    constructor(public writable: any) {
+      writable.lockedByTarget = true;
+    }
+  },
   Input: class {
     async getPrimaryVideoTrack() {
       return null;
     }
   },
   Output: class {
-    target: unknown;
+    target: any;
     constructor(o: { target: unknown }) {
       this.target = o.target;
       mb.outputs.push(this);
     }
     async cancel() {
-      mb.log.push('cancel');
+      if (this.target.writable) this.target.writable.open = false;
     }
   },
   Conversion: { init: vi.fn(async () => mb.conversion) },
@@ -54,50 +59,54 @@ import { BufferTarget, Conversion, StreamTarget } from 'mediabunny';
 
 import { STORAGE_FULL } from './definitions';
 
-type Dir = ReturnType<typeof fakeDir>;
 const fakeDir = (onKeys?: () => void) => {
   const entries = new Map<string, any>();
-  return {
+  const dir = {
     entries,
     onKeys,
+    removed: false,
     async getDirectoryHandle(name: string) {
       if (!entries.has(name)) entries.set(name, fakeDir());
       return entries.get(name);
     },
     async getFileHandle(name: string) {
-      const file = {
-        createWritable: async () => ({
-          abort: async () => {
-            mb.log.push('abort');
-          },
-        }),
-        getFile: async () => new Blob(['out']),
+      if (dir.removed) throw new DOMException('gone', 'NotFoundError');
+      const writable = {
+        open: true,
+        lockedByTarget: false,
+        async abort() {
+          if (writable.lockedByTarget) throw new TypeError('locked');
+          writable.open = false;
+        },
       };
+      const file = { writable, createWritable: async () => writable, getFile: async () => new File(['out'], name) };
       entries.set(name, file);
       return file;
     },
     async removeEntry(name: string) {
-      mb.log.push(`remove ${name}`);
+      if (entries.get(name)?.writable?.open) throw new DOMException('open', 'NoModificationAllowedError');
       entries.delete(name);
     },
-    keys(this: Dir) {
-      this.onKeys?.();
-      const names = [...entries.keys()];
-      let i = 0;
-      return {
-        next: async () => (i < names.length ? { done: false, value: names[i++] } : { done: true, value: undefined }),
-      };
+    async *keys() {
+      dir.onKeys?.();
+      yield* [...entries.keys()];
     },
   };
+  return dir;
 };
 
-let base: Dir;
+let base: ReturnType<typeof fakeDir>;
 let held: string[];
 let lockRequest: (name: string, cb: () => Promise<never>) => Promise<unknown>;
 
 const compress = async () => {
   const { NativeVideoCompressorWeb } = await import('./web');
   return new NativeVideoCompressorWeb().compressVideo({ sourcePath: 'blob:src', jobId: 'j' });
+};
+
+const onlyTabDir = () => {
+  expect(base.entries.size).toBe(1);
+  return [...base.entries.values()][0] as ReturnType<typeof fakeDir>;
 };
 
 beforeEach(() => {
@@ -107,7 +116,9 @@ beforeEach(() => {
   mb.conversion = { isValid: true, discardedTracks: [], execute: async () => undefined };
   base = fakeDir();
   held = [];
+  // Like Web Locks: requesting an exclusive lock that is already held waits for its release.
   lockRequest = (name, cb) => {
+    if (held.includes(name)) return new Promise(() => undefined);
     held.push(name);
     return cb();
   };
@@ -120,14 +131,24 @@ beforeEach(() => {
     },
   });
   vi.stubGlobal('fetch', vi.fn(async () => ({ blob: async () => new Blob(['v']) })));
-  vi.stubGlobal('URL', Object.assign(URL, { createObjectURL: () => 'blob:out' }));
+  vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:out');
+});
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
 });
 
 describe('NativeVideoCompressorWeb OPFS output', () => {
   it('writes to OPFS and keeps the output', async () => {
     await expect(compress()).resolves.toEqual({ success: true, destPath: 'blob:out' });
     expect(mb.outputs[0].target).toBeInstanceOf(StreamTarget);
-    expect(mb.log).toEqual([]);
+    expect(onlyTabDir().entries.size).toBe(1);
+  });
+
+  it('hands back an mp4-typed Blob', async () => {
+    await compress();
+    expect(vi.mocked(URL.createObjectURL).mock.calls[0][0]).toMatchObject({ type: 'video/mp4' });
   });
 
   it('writes no metadata tags from the input', async () => {
@@ -156,11 +177,21 @@ describe('NativeVideoCompressorWeb OPFS output', () => {
     expect(mb.outputs[0].target).toBeInstanceOf(BufferTarget);
   });
 
-  it('an invalid conversion cancels the output before deleting its file', async () => {
+  it('goes back to OPFS after site data is cleared, without re-requesting the lock it holds', async () => {
+    await compress();
+    onlyTabDir().removed = true;
+    base.entries.clear();
+    // The stale directory handle fails once, so this one buffers in memory.
+    await expect(compress()).resolves.toEqual({ success: true, destPath: 'blob:out' });
+    await expect(compress()).resolves.toEqual({ success: true, destPath: 'blob:out' });
+    expect(mb.outputs[2].target).toBeInstanceOf(StreamTarget);
+    expect(onlyTabDir().entries.size).toBe(1);
+  }, 2000);
+
+  it('an invalid conversion deletes its file and falls back to ffmpeg', async () => {
     mb.conversion = { isValid: false, discardedTracks: [] };
     await compress();
-    expect(mb.log[0]).toBe('cancel');
-    expect(mb.log.slice(1, 3)).toEqual(['abort', expect.stringMatching(/^remove .+\.mp4$/)]);
+    expect(onlyTabDir().entries.size).toBe(0);
     expect(mb.log).toContain('ffmpeg');
   });
 
@@ -170,6 +201,6 @@ describe('NativeVideoCompressorWeb OPFS output', () => {
     };
     await expect(compress()).rejects.toMatchObject({ code: STORAGE_FULL });
     expect(mb.log).not.toContain('ffmpeg');
-    expect(mb.log).toContain('cancel');
+    expect(onlyTabDir().entries.size).toBe(0);
   });
 });

@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const m = vi.hoisted(() => ({ instances: [] as any[] }));
 
@@ -25,12 +25,12 @@ vi.mock('@ffmpeg/ffmpeg', () => ({
 vi.mock('@ffmpeg/util', () => ({ toBlobURL: async (url: string) => url }));
 vi.mock('mediabunny', () => ({ canEncodeVideo: async () => false }));
 
-import { MAX_FFMPEG_INPUT_BYTES, TOO_LARGE_FOR_WEB } from './definitions';
+import { TOO_LARGE_FOR_WEB } from './definitions';
 import { NativeVideoCompressorWeb } from './web';
 
-const start = async (plugin: NativeVideoCompressorWeb, jobId: string) => {
+const start = async (plugin: NativeVideoCompressorWeb, jobId?: string) => {
   const before = m.instances.length;
-  const run = plugin.compressVideo({ sourcePath: `blob:${jobId}`, jobId });
+  const run = plugin.compressVideo({ sourcePath: 'blob:src', jobId });
   run.catch(() => undefined);
   await vi.waitFor(() => expect(m.instances.length).toBe(before + 1));
   return { run, ffmpeg: m.instances[before] };
@@ -42,11 +42,16 @@ beforeEach(() => {
     'fetch',
     vi.fn(async () => ({ blob: async () => new Blob(['v']) })),
   );
-  vi.stubGlobal('URL', Object.assign(URL, { createObjectURL: () => 'blob:out' }));
+  vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:out');
 });
 
-describe('NativeVideoCompressorWeb: job bỏ dở rồi job mới chạy', () => {
-  it('job cũ load xong muộn: tự huỷ, không chiếm ffmpeg, không bắn tiến độ; job mới vẫn huỷ được', async () => {
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+});
+
+describe('NativeVideoCompressorWeb: an abandoned job followed by a new one', () => {
+  it('a stale job that finishes loading late cancels itself, takes no ffmpeg, emits no progress; the new job stays cancellable', async () => {
     const plugin = new NativeVideoCompressorWeb();
     const progress = vi.fn();
     await plugin.addListener('onProgress', progress);
@@ -68,7 +73,7 @@ describe('NativeVideoCompressorWeb: job bỏ dở rồi job mới chạy', () =>
     await expect(live.run).rejects.toMatchObject({ code: 'CANCELLED' });
   });
 
-  it('job mới vẫn nén xong bình thường sau job cũ bị bỏ', async () => {
+  it('the new job still compresses normally after the old one was abandoned', async () => {
     const plugin = new NativeVideoCompressorWeb();
     const stale = await start(plugin, 'A');
     await plugin.cancel({ jobId: 'A' });
@@ -83,15 +88,30 @@ describe('NativeVideoCompressorWeb: job bỏ dở rồi job mới chạy', () =>
     expect(live.ffmpeg.exec.mock.calls[0][0].join(' ')).toContain('-map_metadata -1');
   });
 
-  it('WebCodecs không dùng được và file lớn hơn trần ffmpeg: từ chối TOO_LARGE_FOR_WEB, không nạp ffmpeg', async () => {
+  it('rejects TOO_LARGE_FOR_WEB without loading ffmpeg when WebCodecs is unavailable and the file exceeds 200 MB', async () => {
     vi.stubGlobal(
       'fetch',
-      vi.fn(async () => ({ blob: async () => ({ size: MAX_FFMPEG_INPUT_BYTES + 1 }) })),
+      vi.fn(async () => ({ blob: async () => ({ size: 200 * 1024 * 1024 + 1 }) })),
     );
     const plugin = new NativeVideoCompressorWeb();
     await expect(plugin.compressVideo({ sourcePath: 'blob:big', jobId: 'big' })).rejects.toMatchObject({
       code: TOO_LARGE_FOR_WEB,
     });
     expect(m.instances).toHaveLength(0);
+  });
+
+  it('two jobs without a jobId: the abandoned one neither runs on nor clears the new one', async () => {
+    const plugin = new NativeVideoCompressorWeb();
+    const stale = await start(plugin);
+    await plugin.cancel();
+    const live = await start(plugin);
+
+    stale.ffmpeg.finishLoad();
+    await expect(stale.run).rejects.toMatchObject({ code: 'CANCELLED' });
+    expect(stale.ffmpeg.exec).not.toHaveBeenCalled();
+
+    expect(await plugin.cancel()).toEqual({ cancelled: true });
+    live.ffmpeg.finishLoad();
+    await expect(live.run).rejects.toMatchObject({ code: 'CANCELLED' });
   });
 });
