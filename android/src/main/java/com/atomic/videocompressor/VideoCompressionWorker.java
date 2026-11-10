@@ -81,6 +81,19 @@ public class VideoCompressionWorker extends Worker {
         return true;
     }
 
+    /** Dừng và gỡ mọi job đang đăng ký - chúng thuộc một phiên WebView đã chết. */
+    static void stopAll() {
+        for (String jobId : pending.keySet()) stop(jobId);
+    }
+
+    /** Dừng và gỡ job của jobId; false khi không còn job nào mang id đó. */
+    static boolean stop(String jobId) {
+        Job job = pending.remove(jobId);
+        if (job == null) return false;
+        job.stop();
+        return true;
+    }
+
     @Nullable
     private volatile Job running = null;
 
@@ -106,7 +119,8 @@ public class VideoCompressionWorker extends Worker {
             job.run();
         } finally {
             running = null;
-            pending.remove(jobId);
+            // Hai tham số: một phiên mới có thể đã đăng ký lại cùng jobId.
+            pending.remove(jobId, job);
         }
         return Result.success();
     }

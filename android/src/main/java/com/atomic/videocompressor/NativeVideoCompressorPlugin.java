@@ -1,5 +1,6 @@
 package com.atomic.videocompressor;
 
+import android.media.MediaMetadataRetriever;
 import android.net.Uri;
 import android.util.Log;
 import androidx.annotation.NonNull;
@@ -21,6 +22,8 @@ import com.getcapacitor.annotation.CapacitorPlugin;
 import java.io.File;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashSet;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -38,11 +41,29 @@ public class NativeVideoCompressorPlugin extends Plugin {
 
     private static final String STORAGE_SUBFOLDER = "compressed_videos";
 
+    /** Gắn lên mọi work của plugin để dọn được job mồ côi của phiên WebView trước. */
+    private static final String WORK_TAG = "native-video-compressor";
+
+    /** Thứ tự khớp NativeVideoCompressor.SOURCE_FACTORS. */
+    private static final VideoQuality[] QUALITY_BY_SOURCE_FACTOR = {
+        VideoQuality.VERY_LOW,
+        VideoQuality.LOW,
+        VideoQuality.MEDIUM,
+        VideoQuality.HIGH,
+        VideoQuality.VERY_HIGH
+    };
+
     /**
      * Trần cho pha giữ-chờ-upload. Ngắn hơn mốc 10 phút mà WorkManager tự cắt,
      * để một caller chết giữa chừng không chiếm quota job tới tận phút cuối.
      */
     private static final long HOLD_FOR_UPLOAD_TIMEOUT_MINUTES = 8;
+
+    /**
+     * Mốc process này nạp plugin - trước mọi lần nén của nó. Bản sao nguồn cũ
+     * hơn mốc này là của một process đã chết.
+     */
+    private static final long PROCESS_START_MS = System.currentTimeMillis();
 
     /** The job compressVideo is running right now, for cancel({ jobId }). */
     private String currentJobId = null;
@@ -60,9 +81,93 @@ public class NativeVideoCompressorPlugin extends Plugin {
         call.resolve(ret);
     }
 
+    /** Bridge mới (Activity dựng lại): mọi job còn chạy thuộc phiên cũ. */
+    @Override
+    public void load() {
+        cancelOrphans(PROCESS_START_MS);
+    }
+
     /**
-     * Stop the running compress. LightCompressor cancels its coroutine job and
-     * fires onCancelled, which is already wired below.
+     * Bridge gọi hàm này ở onPageStarted (Bridge.reset), tức mỗi lần WebView
+     * tải lại trang - load() thì không chạy lại. JS cũ đã chết nên không còn
+     * ai nhận kết quả các job đang chạy.
+     *
+     * Mốc dọn là "bây giờ": JS mới chưa chạy nên mọi bản sao nguồn đều mồ
+     * côi, kể cả bản một job huỷ giữa pha chép vẫn đang ghi tiếp sau claim().
+     */
+    @Override
+    public void removeAllListeners() {
+        super.removeAllListeners();
+        cancelOrphans(System.currentTimeMillis());
+    }
+
+    /**
+     * Dừng job trong process trước, đồng bộ, rồi mới huỷ work. Huỷ work là bất
+     * đồng bộ: onStopped tới muộn sẽ gọi VideoCompressor.cancel() - vốn global
+     * - và giết luôn job đầu tiên của phiên mới. Dừng trước thì onStopped gặp
+     * job đã stopped và không làm gì.
+     *
+     * ponytail: cờ isRunning của LightCompressor là global; nếu phiên mới gọi
+     * start trước khi vòng nén cũ kịp đọc cờ (mỗi ~100 µs) thì job cũ chạy
+     * tiếp. JS boot mất cả giây nên gần như không xảy ra; cần chặt hơn thì
+     * phải bỏ LightCompressor.
+     */
+    private void cancelOrphans(long copiesOlderThan) {
+        VideoCompressionWorker.stopAll();
+        try {
+            WorkManager.getInstance(getContext()).cancelAllWorkByTag(WORK_TAG);
+        } catch (Exception e) {
+            Log.w(TAG, "Could not cancel orphaned work", e);
+        }
+        // Process bị kill giữa chừng thì không job nào kịp dọn bản sao của nó.
+        for (File copy : sourceCopies()) {
+            if (NativeVideoCompressor.isStaleSourceCopy(copy.getName(), copy.lastModified(), copiesOlderThan)) {
+                deleteQuietly(copy);
+            }
+        }
+    }
+
+    /** File thường ở gốc dataDir mang tên đúng 13 chữ số - xem NativeVideoCompressor.isSourceCopyName. */
+    private File[] sourceCopies() {
+        try {
+            File[] files = new File(getContext().getApplicationInfo().dataDir).listFiles(
+                (File f) -> f.isFile() && NativeVideoCompressor.isSourceCopyName(f.getName())
+            );
+            if (files != null) return files;
+        } catch (Exception e) {
+            Log.w(TAG, "Could not list source copies", e);
+        }
+        return new File[0];
+    }
+
+    private Set<String> sourceCopyNames() {
+        Set<String> names = new HashSet<>();
+        for (File copy : sourceCopies()) names.add(copy.getName());
+        return names;
+    }
+
+    /**
+     * Xoá bản sao xuất hiện sau `before`. Nếu job khác đang chạy song song mà
+     * bản sao của nó bị xoá theo cũng vô hại: LightCompressor 1.3.2 chỉ
+     * null-check đường dẫn đó, còn nén thì đọc thẳng từ Uri gốc.
+     */
+    private void deleteSourceCopiesSince(Set<String> before) {
+        for (File copy : sourceCopies()) {
+            if (!before.contains(copy.getName())) deleteQuietly(copy);
+        }
+    }
+
+    private void deleteQuietly(File file) {
+        try {
+            if (!file.delete()) Log.w(TAG, "Could not delete " + file);
+        } catch (Exception e) {
+            Log.w(TAG, "Could not delete " + file, e);
+        }
+    }
+
+    /**
+     * Stop the running compress. The job is stopped directly and answers
+     * CANCELLED itself; LightCompressor's own callbacks after that are no-ops.
      */
     @PluginMethod
     public void cancel(PluginCall call) {
@@ -79,11 +184,12 @@ public class NativeVideoCompressorPlugin extends Plugin {
         synchronized (this) {
             cancelled = currentJobId != null && (requested == null || requested.equals(currentJobId));
             if (cancelled) {
-                // Huỷ cả work: pha nén có thể chưa kịp bắt đầu, lúc đó
-                // VideoCompressor.cancel() không có gì để huỷ và work vẫn sẽ
-                // chạy sau đó. Huỷ work làm onStopped bắn và job tự kết thúc.
-                cancelWork(currentJobId);
-                VideoCompressor.cancel();
+                String jobId = currentJobId;
+                // Dừng job trực tiếp chứ không trông vào onStopped: work còn
+                // ENQUEUED thì huỷ xong WorkManager không hề dựng Worker, nên
+                // onStopped không bao giờ bắn và PluginCall sẽ treo.
+                if (!VideoCompressionWorker.stop(jobId)) VideoCompressor.cancel();
+                cancelWork(jobId);
             }
         }
 
@@ -131,34 +237,60 @@ public class NativeVideoCompressorPlugin extends Plugin {
 
         // Đọc quality từ Javascript (Mặc định là MEDIUM)
         String qualityString = call.getString("quality", "MEDIUM");
+        NativeVideoCompressor.Target target = NativeVideoCompressor.target(qualityString);
 
-        VideoQuality videoQuality = VideoQuality.MEDIUM;
-        if (qualityString != null) {
-            if (qualityString.equals("360P")) {
-                videoQuality = VideoQuality.LOW; // Map 360p to LOW quality on Android
-            } else if (qualityString.equals("LOW")) {
-                videoQuality = VideoQuality.VERY_LOW; // Adjusting others dynamically if needed
-            } else {
-                try {
-                    videoQuality = VideoQuality.valueOf(qualityString);
-                } catch (IllegalArgumentException e) {
-                    videoQuality = VideoQuality.MEDIUM;
-                }
-            }
+        // Kích thước + bitrate theo cùng bậc thang với iOS/web. Đọc metadata
+        // hỏng thì để null, LightCompressor tự chọn như trước.
+        int[] size = null;
+        NativeVideoCompressor.BitratePlan bitrate = null;
+        MediaMetadataRetriever retriever = new MediaMetadataRetriever();
+        try {
+            retriever.setDataSource(getContext(), srcUri);
+            int width = Integer.parseInt(retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH));
+            int height = Integer.parseInt(retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT));
+            size = NativeVideoCompressor.outputSize(width, height, target.shortSide);
+            bitrate = NativeVideoCompressor.bitrate(
+                target.bitrate,
+                Long.parseLong(retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_BITRATE))
+            );
+        } catch (Exception e) {
+            Log.w(TAG, "Could not read video metadata, using LightCompressor defaults", e);
+        } finally {
+            // release() khai báo IOException từ API 29; không dùng
+            // try-with-resources vì minSdk 24 chưa có AutoCloseable.
+            try {
+                retriever.release();
+            } catch (Exception ignored) {}
         }
 
-        Log.d(TAG, "====== VIDEO COMPRESSION QUALITY RECEIVED: " + qualityString + "+ video quality: " + videoQuality + " ======");
+        // Với bitrate tính theo nguồn, quality chỉ còn chọn hệ số nhân của
+        // LightCompressor; với Mbps tường minh hoặc metadata hỏng thì giữ MEDIUM.
+        VideoQuality videoQuality = bitrate != null && bitrate.mbps == null
+            ? QUALITY_BY_SOURCE_FACTOR[bitrate.sourceFactorIndex]
+            : VideoQuality.MEDIUM;
+
+        Log.d(
+            TAG,
+            "Compress " +
+            qualityString +
+            ": size=" +
+            (size == null ? "default" : size[0] + "x" + size[1]) +
+            ", mbps=" +
+            (bitrate == null ? "default" : bitrate.mbps) +
+            ", quality=" +
+            videoQuality
+        );
 
         // 2. Cấu hình thông số nén (Dành riêng cho LightCompressor 1.3.2)
-        // Lưu ý: Java phải truyền đủ 9 tham số do thư viện gốc viết bằng Kotlin
+        // Thứ tự tham số theo Configuration.kt: height ĐỨNG TRƯỚC width.
         Configuration configuration = new Configuration(
             videoQuality, // Chất lượng nén
             false, // tắt tính năng giới hạn Bitrate tối thiểu của file gốc
-            null, // videoBitrateInMbps (Ép buộc giá trị Bitrate để đảm bảo file luôn nhẹ đi)
+            bitrate == null ? null : bitrate.mbps, // videoBitrateInMbps
             false, // disableAudio
             false, // keepOriginalResolution
-            null, // videoWidth
-            null, // videoHeight
+            size == null ? null : Double.valueOf(size[1]), // videoHeight
+            size == null ? null : Double.valueOf(size[0]), // videoWidth
             Arrays.asList(fileName) // videoNames
         );
 
@@ -179,6 +311,7 @@ public class NativeVideoCompressorPlugin extends Plugin {
 
         OneTimeWorkRequest request = new OneTimeWorkRequest.Builder(VideoCompressionWorker.class)
             .setInputData(new Data.Builder().putString(VideoCompressionWorker.KEY_JOB_ID, jobId).build())
+            .addTag(WORK_TAG)
             .build();
 
         try {
@@ -220,6 +353,9 @@ public class NativeVideoCompressorPlugin extends Plugin {
         /** True khi nén xong có kết quả dùng được, tức là có cái để upload. */
         private volatile boolean compressed = false;
 
+        /** Bản sao nguồn có sẵn trước job này; claim() xoá những cái mới hơn. */
+        private volatile Set<String> copiesBefore = null;
+
         private boolean started = false;
         private boolean stopped = false;
 
@@ -247,6 +383,7 @@ public class NativeVideoCompressorPlugin extends Plugin {
                 // stop() đã chạy trước khi worker kịp khởi động: đừng bắt đầu
                 // một lần nén mà không còn ai chờ kết quả.
                 if (!stopped) {
+                    copiesBefore = sourceCopyNames();
                     VideoCompressor.start(
                         getContext(),
                         Collections.singletonList(srcUri), // Nhận vào một List chứa đường dẫn
@@ -305,19 +442,21 @@ public class NativeVideoCompressorPlugin extends Plugin {
             // chờ finishUpload nữa.
             released.countDown();
 
-            if (wasRunning) {
-                // onCancelled của LightCompressor sẽ mở chốt; không tự gọi
-                // deliverCancelled ở đây để nhánh dọn file tạm vẫn chạy.
+            // Đã trả kết quả (đang giữ cho upload) thì không còn gì của job này
+            // để huỷ - cancel() global lúc đó chỉ giết job khác đang nén.
+            if (wasRunning && !delivered.get()) {
                 try {
                     VideoCompressor.cancel();
                 } catch (Exception e) {
                     Log.w(TAG, "Could not cancel compression", e);
-                    deliverCancelled();
                 }
-            } else {
-                // Chưa bắt đầu thì không có callback nào bắn, phải tự kết thúc.
-                deliverCancelled();
             }
+            // Luôn tự kết thúc: coroutine của LightCompressor bị huỷ thường ném
+            // CancellationException mà không bắn callback nào (trước onStart,
+            // hay lúc processAudio/finishMovie không đọc isRunning). claim()
+            // biến onCancelled tới sau thành no-op, còn onSuccess lỡ tới thì
+            // tự xoá output.
+            deliverCancelled();
         }
 
         private CompressionListener listener() {
@@ -334,6 +473,7 @@ public class NativeVideoCompressorPlugin extends Plugin {
                 @Override
                 public void onFailure(int i, @NonNull String failureMessage) {
                     if (!claim()) return;
+                    deleteOutput(fileName);
                     call.reject("Nén thất bại: " + failureMessage);
                 }
 
@@ -343,7 +483,12 @@ public class NativeVideoCompressorPlugin extends Plugin {
                     // đọc `compressed` ngay khi chốt đó mở để quyết định có ở
                     // lại chờ upload hay không.
                     compressed = s != null;
-                    if (!claim()) return;
+                    if (!claim()) {
+                        // Đã trả CANCELLED trước đó (stop() tự kết thúc):
+                        // không ai nhận file này.
+                        deleteOutput(fileName);
+                        return;
+                    }
                     // Nén xong, trả kết quả đường dẫn file mới về cho JS
                     JSObject ret = new JSObject();
                     ret.put("success", true);
@@ -379,6 +524,8 @@ public class NativeVideoCompressorPlugin extends Plugin {
         /** True đúng một lần, cho nhánh kết thúc đầu tiên tới đích. */
         private boolean claim() {
             if (!delivered.compareAndSet(false, true)) return false;
+            Set<String> before = copiesBefore;
+            if (before != null) deleteSourceCopiesSince(before);
             synchronized (NativeVideoCompressorPlugin.this) {
                 if (jobId.equals(currentJobId)) currentJobId = null;
             }
@@ -400,10 +547,12 @@ public class NativeVideoCompressorPlugin extends Plugin {
         }
     }
 
-    /** Best-effort: a partial file left in the cache is not worth failing over. */
+    /** Best-effort: a partial file left behind is not worth failing over. */
     private void deleteOutput(String fileName) {
         try {
-            File dir = new File(getContext().getExternalFilesDir(null), STORAGE_SUBFOLDER);
+            // Nơi LightCompressor 1.3.2 ghi với AppSpecificStorageConfiguration:
+            // File(context.filesDir, "<subFolder>/<name>").
+            File dir = new File(getContext().getFilesDir(), STORAGE_SUBFOLDER);
             File partial = new File(dir, fileName);
             if (partial.exists()) {
                 partial.delete();
