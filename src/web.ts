@@ -14,6 +14,7 @@ import {
   StreamTarget,
   canEncodeVideo,
 } from 'mediabunny';
+import type { InputVideoTrack } from 'mediabunny';
 
 import type {
   NativeVideoCompressorPlugin,
@@ -53,29 +54,42 @@ const isQuotaError = (e: unknown): boolean => {
 const MAX_FFMPEG_INPUT_BYTES = 200 * 1024 * 1024;
 
 /**
- * Per quality tier. WebCodecs: cap height + a bitrate ceiling; the quantizer
+ * Per quality tier. `shortSide` caps the shorter display side, so portrait and
+ * landscape get the same box as on iOS. WebCodecs: that + a bitrate ceiling; the quantizer
  * (constant 26, CRF-like) drives quality where the encoder honours it, but
  * H.264 on most browsers is bitrate-driven, so `bitrate` is the real knob.
- * ffmpeg: same height, `crf` and `audioBitrate`. fps is capped to 30 at call
+ * ffmpeg: same short side, `crf` and `audioBitrate`. fps is capped to 30 at call
  * time (never upsampled). On WebCodecs audio is left to mediabunny, which
  * re-encodes to AAC for the MP4 container.
  */
-const QUALITY_LADDER: Record<VideoQuality, { height: number; bitrate: number; crf: number; audioBitrate: string }> = {
-  VERY_HIGH: { height: 1080, bitrate: 4000000, crf: 23, audioBitrate: '128k' },
-  HIGH: { height: 720, bitrate: 2000000, crf: 28, audioBitrate: '128k' },
-  MEDIUM: { height: 540, bitrate: 1200000, crf: 30, audioBitrate: '96k' },
-  LOW: { height: 480, bitrate: 1000000, crf: 32, audioBitrate: '96k' },
-  '360P': { height: 360, bitrate: 700000, crf: 28, audioBitrate: '64k' },
-  VERY_LOW: { height: 240, bitrate: 350000, crf: 35, audioBitrate: '48k' },
+const QUALITY_LADDER: Record<VideoQuality, { shortSide: number; bitrate: number; crf: number; audioBitrate: string }> = {
+  VERY_HIGH: { shortSide: 1080, bitrate: 4000000, crf: 23, audioBitrate: '128k' },
+  HIGH: { shortSide: 720, bitrate: 2000000, crf: 28, audioBitrate: '128k' },
+  MEDIUM: { shortSide: 540, bitrate: 1200000, crf: 30, audioBitrate: '96k' },
+  LOW: { shortSide: 480, bitrate: 1000000, crf: 32, audioBitrate: '96k' },
+  '360P': { shortSide: 360, bitrate: 700000, crf: 28, audioBitrate: '64k' },
+  VERY_LOW: { shortSide: 240, bitrate: 350000, crf: 35, audioBitrate: '48k' },
 };
 
 const WEBCODECS_QUANTIZER = 26;
+
+// Never upscales. Mediabunny derives the other side from the aspect ratio and rounds both up to even.
+export const webCodecsSize = (displayWidth: number, displayHeight: number, shortSide: number) => {
+  const side = Math.min(shortSide, displayWidth, displayHeight);
+  return displayHeight > displayWidth ? { width: side } : { height: side };
+};
+
+// iw/ih are post-autorotate here: ffmpeg inserts the transpose ahead of -vf.
+// Never upscales; trunc keeps an odd source side even for libx264.
+export const ffmpegScaleFilter = (shortSide: number) =>
+  `scale=w='if(gt(iw,ih),-2,min(${shortSide},trunc(iw/2)*2))':h='if(gt(iw,ih),min(${shortSide},trunc(ih/2)*2),-2)'`;
+
 const FPS_CAP = 30;
 
 // Cap fps at 30, but never upsample. A failed probe leaves the source rate untouched.
-const probeFrameRate = async (input: Input): Promise<number | undefined> => {
+const probeFrameRate = async (track: InputVideoTrack | null): Promise<number | undefined> => {
   try {
-    const stats = await (await input.getPrimaryVideoTrack())?.computePacketStats(100);
+    const stats = await track?.computePacketStats(100);
     return stats && stats.averagePacketRate > 0 ? Math.min(FPS_CAP, Math.round(stats.averagePacketRate)) : undefined;
   } catch {
     return undefined;
@@ -281,17 +295,19 @@ export class NativeVideoCompressorWeb extends WebPlugin implements NativeVideoCo
   private async runConversion(
     input: Input,
     output: Output,
-    { height, bitrate }: { height: number; bitrate: number },
+    { shortSide, bitrate }: { shortSide: number; bitrate: number },
     throwIfCancelled: () => void,
   ): Promise<boolean> {
-    const frameRate = await probeFrameRate(input);
+    const track = await input.getPrimaryVideoTrack();
+    const frameRate = await probeFrameRate(track);
+    const size = track ? webCodecsSize(await track.getDisplayWidth(), await track.getDisplayHeight(), shortSide) : {};
     throwIfCancelled();
 
     const conversion = await Conversion.init({
       input,
       output,
       video: {
-        height,
+        ...size,
         quality: new Quality({ quantizer: WEBCODECS_QUANTIZER, bitrate }),
         // Not 'prefer-hardware': machines without a hardware H.264 encoder
         // (Linux, VMs, headless) then fail mid-encode and drop to ffmpeg.wasm.
@@ -396,7 +412,7 @@ export class NativeVideoCompressorWeb extends WebPlugin implements NativeVideoCo
     const inputFileName = 'input.mp4';
     const outputFileName = 'output.mp4';
 
-    const { height, crf, audioBitrate } = QUALITY_LADDER[quality];
+    const { shortSide, crf, audioBitrate } = QUALITY_LADDER[quality];
 
     const inputData = new Uint8Array(await blob.arrayBuffer());
 
@@ -414,7 +430,7 @@ export class NativeVideoCompressorWeb extends WebPlugin implements NativeVideoCo
     const args = [
       '-i', inputFileName, '-map_metadata', '-1',
       '-c:v', 'libx264', '-preset', 'superfast', '-crf', String(crf),
-      '-vf', `scale=-2:${height}`,
+      '-vf', ffmpegScaleFilter(shortSide),
       '-c:a', 'aac', '-b:a', audioBitrate,
       outputFileName,
     ];

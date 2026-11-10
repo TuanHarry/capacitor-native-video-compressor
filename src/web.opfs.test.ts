@@ -4,6 +4,7 @@ const mb = vi.hoisted(() => ({
   outputs: [] as any[],
   log: [] as string[],
   conversion: null as any,
+  track: null as any,
 }));
 
 vi.mock('@ffmpeg/ffmpeg', () => ({
@@ -39,7 +40,7 @@ vi.mock('mediabunny', () => ({
   },
   Input: class {
     async getPrimaryVideoTrack() {
-      return null;
+      return mb.track;
     }
   },
   Output: class {
@@ -113,6 +114,7 @@ beforeEach(() => {
   vi.resetModules();
   mb.outputs.splice(0);
   mb.log.splice(0);
+  mb.track = null;
   mb.conversion = { isValid: true, discardedTracks: [], execute: async () => undefined };
   base = fakeDir();
   held = [];
@@ -154,6 +156,21 @@ describe('NativeVideoCompressorWeb OPFS output', () => {
   it('writes no metadata tags from the input', async () => {
     await compress();
     expect(Conversion.init).toHaveBeenCalledWith(expect.objectContaining({ tags: {} }));
+  });
+
+  it.each([
+    ['rotated portrait', 1080, 1920, { width: 540 }],
+    ['landscape', 1920, 1080, { height: 540 }],
+  ])('sizes a %s source by its display short side', async (_, displayWidth, displayHeight, size) => {
+    mb.track = {
+      getDisplayWidth: async () => displayWidth,
+      getDisplayHeight: async () => displayHeight,
+      computePacketStats: async () => ({ averagePacketRate: 30 }),
+    };
+    await compress();
+    const { video } = vi.mocked(Conversion.init).mock.lastCall![0] as any;
+    expect(video).toMatchObject(size);
+    expect(video).not.toHaveProperty(Object.keys(size)[0] === 'width' ? 'height' : 'width');
   });
 
   it('sweep never deletes a tab that takes its lock and directory while the sweep is listing', async () => {

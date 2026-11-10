@@ -187,6 +187,13 @@ public class NativeVideoCompressorPlugin: CAPPlugin, CAPBridgedPlugin {
                 AVVideoCodecKey: AVVideoCodecType.h264,
                 AVVideoWidthKey: Int(outputWidth),
                 AVVideoHeightKey: Int(outputHeight),
+                // 8-bit H.264 can't carry HDR: without this an HLG/PQ source keeps its BT.2020 tags on SDR-range data.
+                // The writer colour-converts (tone-maps) tagged buffers to these properties; BT.709 sources pass through unchanged.
+                AVVideoColorPropertiesKey: [
+                    AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
+                    AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
+                    AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2
+                ],
                 AVVideoCompressionPropertiesKey:[
                     AVVideoAverageBitRateKey: targetBitrate, // ÉP BITRATE TẠI ĐÂY
                     AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel
