@@ -47,10 +47,10 @@ vi.mock('mediabunny', () => ({
       mb.log.push('cancel');
     }
   },
-  Conversion: { init: async () => mb.conversion },
+  Conversion: { init: vi.fn(async () => mb.conversion) },
 }));
 
-import { BufferTarget, StreamTarget } from 'mediabunny';
+import { BufferTarget, Conversion, StreamTarget } from 'mediabunny';
 
 import { STORAGE_FULL } from './definitions';
 
@@ -128,6 +128,11 @@ describe('NativeVideoCompressorWeb OPFS output', () => {
     await expect(compress()).resolves.toEqual({ success: true, destPath: 'blob:out' });
     expect(mb.outputs[0].target).toBeInstanceOf(StreamTarget);
     expect(mb.log).toEqual([]);
+  });
+
+  it('writes no metadata tags from the input', async () => {
+    await compress();
+    expect(Conversion.init).toHaveBeenCalledWith(expect.objectContaining({ tags: {} }));
   });
 
   it('sweep never deletes a tab that takes its lock and directory while the sweep is listing', async () => {

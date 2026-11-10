@@ -80,6 +80,7 @@ describe('NativeVideoCompressorWeb: job bỏ dở rồi job mới chạy', () =>
 
     await expect(live.run).resolves.toEqual({ success: true, destPath: 'blob:out' });
     expect(live.ffmpeg.exec).toHaveBeenCalledTimes(1);
+    expect(live.ffmpeg.exec.mock.calls[0][0].join(' ')).toContain('-map_metadata -1');
   });
 
   it('WebCodecs không dùng được và file lớn hơn trần ffmpeg: từ chối TOO_LARGE_FOR_WEB, không nạp ffmpeg', async () => {

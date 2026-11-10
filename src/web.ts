@@ -408,6 +408,8 @@ export class NativeVideoCompressorWeb extends WebPlugin implements NativeVideoCo
         hardwareAcceleration: 'no-preference',
         ...(frameRate ? { frameRate } : {}),
       },
+      // The default copies the input's title/description/comment; phone videos can carry identifying text there.
+      tags: {},
     });
 
     if (!conversion.isValid) {
@@ -556,7 +558,8 @@ export class NativeVideoCompressorWeb extends WebPlugin implements NativeVideoCo
     }
     throwIfCancelled();
 
-    const args: string[] = ['-i', inputFileName];
+    // ffmpeg copies global metadata by default, including the GPS location (©xyz / loci).
+    const args: string[] = ['-i', inputFileName, '-map_metadata', '-1'];
     args.push('-c:v', 'libx264', '-preset', 'superfast', '-crf', crf);
     if (scale) {
       args.push(...scale.split(' '));
