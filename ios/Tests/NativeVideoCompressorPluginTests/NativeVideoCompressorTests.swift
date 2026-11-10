@@ -1,4 +1,5 @@
 import XCTest
+import CoreMedia
 @testable import NativeVideoCompressorPlugin
 
 class NativeVideoCompressorTests: XCTestCase {
@@ -27,5 +28,21 @@ class NativeVideoCompressorTests: XCTestCase {
         XCTAssertEqual(size(641, 361), [640, 360])
         XCTAssertEqual(size(1920, 1080, 1080), [1920, 1080])
         XCTAssertNil(size(0, 0))
+    }
+
+    func testCappedBitrateNeverExceedsSourceAndKeepsFloor() {
+        XCTAssertEqual(NativeVideoCompressor.cappedBitrate(target: 1_500_000, sourceRate: 1_000_000, floor: 200_000), 1_000_000)
+        XCTAssertEqual(NativeVideoCompressor.cappedBitrate(target: 1_500_000, sourceRate: 9_000_000, floor: 200_000), 1_500_000)
+        XCTAssertEqual(NativeVideoCompressor.cappedBitrate(target: 1_500_000, sourceRate: 1_000, floor: 200_000), 200_000)
+        XCTAssertEqual(NativeVideoCompressor.cappedBitrate(target: 1_500_000, sourceRate: 0, floor: 200_000), 1_500_000)
+        XCTAssertEqual(NativeVideoCompressor.cappedBitrate(target: 128_000, sourceRate: 96_000, floor: 64_000), 96_000)
+        XCTAssertEqual(NativeVideoCompressor.cappedBitrate(target: 1_500_000, sourceRate: 1e30, floor: 200_000), 1_500_000)
+        XCTAssertEqual(NativeVideoCompressor.cappedBitrate(target: 1_500_000, sourceRate: 800_000, floor: 200_000, headroom: 1.5), 1_200_000)
+        XCTAssertEqual(NativeVideoCompressor.cappedBitrate(target: 1_500_000, sourceRate: 1_200_000, floor: 200_000, headroom: 1.5), 1_500_000)
+    }
+
+    func testCodecHeadroom() {
+        XCTAssertEqual(NativeVideoCompressor.codecHeadroom(kCMVideoCodecType_HEVC), 1.5)
+        XCTAssertEqual(NativeVideoCompressor.codecHeadroom(kCMVideoCodecType_H264), 1)
     }
 }

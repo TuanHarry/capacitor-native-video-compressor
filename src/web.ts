@@ -86,13 +86,28 @@ export const ffmpegScaleFilter = (shortSide: number) =>
 
 const FPS_CAP = 30;
 
-// Cap fps at 30, but never upsample. A failed probe leaves the source rate untouched.
-const probeFrameRate = async (track: InputVideoTrack | null): Promise<number | undefined> => {
+const MIN_VIDEO_BITRATE = 200_000;
+
+// A lean source re-encoded at the tier bitrate comes out larger than it went in.
+// The floor stops a broken source estimate from producing an unwatchable file.
+export const capBitrate = (target: number, sourceBitrate: number | undefined, floor: number, headroom = 1) =>
+  sourceBitrate && sourceBitrate > 0 ? Math.min(target, Math.max(floor, Math.round(sourceBitrate * headroom))) : target;
+
+// H.264 needs about 1.5x the bitrate of these codecs for the same picture.
+export const codecHeadroom = (codec: string | null | undefined) =>
+  codec === 'hevc' || codec === 'vp9' || codec === 'av1' ? 1.5 : 1;
+
+// Cap fps at 30, but never upsample. A failed probe leaves the source rate and bitrate untouched.
+const probeVideoStats = async (track: InputVideoTrack | null): Promise<{ frameRate?: number; bitrate?: number }> => {
   try {
     const stats = await track?.computePacketStats(100);
-    return stats && stats.averagePacketRate > 0 ? Math.min(FPS_CAP, Math.round(stats.averagePacketRate)) : undefined;
+    if (!stats) return {};
+    return {
+      frameRate: stats.averagePacketRate > 0 ? Math.min(FPS_CAP, Math.round(stats.averagePacketRate)) : undefined,
+      bitrate: stats.averageBitrate,
+    };
   } catch {
-    return undefined;
+    return {};
   }
 };
 
@@ -299,7 +314,7 @@ export class NativeVideoCompressorWeb extends WebPlugin implements NativeVideoCo
     throwIfCancelled: () => void,
   ): Promise<boolean> {
     const track = await input.getPrimaryVideoTrack();
-    const frameRate = await probeFrameRate(track);
+    const { frameRate, bitrate: sourceBitrate } = await probeVideoStats(track);
     const size = track ? webCodecsSize(await track.getDisplayWidth(), await track.getDisplayHeight(), shortSide) : {};
     throwIfCancelled();
 
@@ -308,7 +323,10 @@ export class NativeVideoCompressorWeb extends WebPlugin implements NativeVideoCo
       output,
       video: {
         ...size,
-        quality: new Quality({ quantizer: WEBCODECS_QUANTIZER, bitrate }),
+        quality: new Quality({
+          quantizer: WEBCODECS_QUANTIZER,
+          bitrate: capBitrate(bitrate, sourceBitrate, MIN_VIDEO_BITRATE, codecHeadroom(track?.codec)),
+        }),
         // Not 'prefer-hardware': machines without a hardware H.264 encoder
         // (Linux, VMs, headless) then fail mid-encode and drop to ffmpeg.wasm.
         // The browser still picks the hardware encoder when it has one, and the

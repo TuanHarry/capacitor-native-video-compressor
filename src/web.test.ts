@@ -26,7 +26,7 @@ vi.mock('@ffmpeg/util', () => ({ toBlobURL: async (url: string) => url }));
 vi.mock('mediabunny', () => ({ canEncodeVideo: async () => false }));
 
 import { TOO_LARGE_FOR_WEB } from './definitions';
-import { NativeVideoCompressorWeb, ffmpegScaleFilter, webCodecsSize } from './web';
+import { NativeVideoCompressorWeb, capBitrate, codecHeadroom, ffmpegScaleFilter, webCodecsSize } from './web';
 
 const start = async (plugin: NativeVideoCompressorWeb, jobId?: string) => {
   const before = m.instances.length;
@@ -134,5 +134,24 @@ describe('short-side sizing', () => {
     expect(ffmpegScaleFilter(540)).toBe(
       "scale=w='if(gt(iw,ih),-2,min(540,trunc(iw/2)*2))':h='if(gt(iw,ih),min(540,trunc(ih/2)*2),-2)'",
     );
+  });
+});
+
+describe('capBitrate', () => {
+  it('never targets more than the source, keeps the floor, ignores a missing estimate', () => {
+    expect(capBitrate(1_200_000, 800_000, 200_000)).toBe(800_000);
+    expect(capBitrate(1_200_000, 5_000_000, 200_000)).toBe(1_200_000);
+    expect(capBitrate(1_200_000, 1_000, 200_000)).toBe(200_000);
+    expect(capBitrate(1_200_000, 0, 200_000)).toBe(1_200_000);
+    expect(capBitrate(1_200_000, undefined, 200_000)).toBe(1_200_000);
+    expect(capBitrate(1_200_000, 600_000, 200_000, 1.5)).toBe(900_000);
+    expect(capBitrate(1_200_000, 1_000_000, 200_000, 1.5)).toBe(1_200_000);
+  });
+
+  it('gives sources in more efficient codecs headroom over H.264', () => {
+    expect(codecHeadroom('hevc')).toBe(1.5);
+    expect(codecHeadroom('av1')).toBe(1.5);
+    expect(codecHeadroom('avc')).toBe(1);
+    expect(codecHeadroom(undefined)).toBe(1);
   });
 });

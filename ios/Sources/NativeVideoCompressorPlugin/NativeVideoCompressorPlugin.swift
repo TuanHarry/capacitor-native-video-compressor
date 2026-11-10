@@ -178,6 +178,8 @@ public class NativeVideoCompressorPlugin: CAPPlugin, CAPBridgedPlugin {
             }
             
             let transform = videoTrack.preferredTransform
+            let sourceCodec = videoTrack.formatDescriptions.first
+                .map { CMFormatDescriptionGetMediaSubType($0 as! CMFormatDescription) } ?? 0
 
             // --- CẤU HÌNH VIDEO ---
             // Decoder and H.264 encoder both work in YUV 4:2:0; asking for BGRA cost two colour conversions per frame.
@@ -204,7 +206,9 @@ public class NativeVideoCompressorPlugin: CAPPlugin, CAPBridgedPlugin {
                     AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2
                 ],
                 AVVideoCompressionPropertiesKey:[
-                    AVVideoAverageBitRateKey: targetBitrate, // ÉP BITRATE TẠI ĐÂY
+                    AVVideoAverageBitRateKey: NativeVideoCompressor.cappedBitrate(
+                        target: targetBitrate, sourceRate: videoTrack.estimatedDataRate, floor: 200_000,
+                        headroom: NativeVideoCompressor.codecHeadroom(sourceCodec)),
                     AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel
                 ]
             ]
@@ -227,7 +231,10 @@ public class NativeVideoCompressorPlugin: CAPPlugin, CAPBridgedPlugin {
                     AVFormatIDKey: kAudioFormatMPEG4AAC,
                     AVNumberOfChannelsKey: 2,
                     AVSampleRateKey: 44100,
-                    AVEncoderBitRateKey: 128000 // Audio nén về 128kbps
+                    // AAC takes only discrete rates and AVAssetWriterInput raises on an unsupported one,
+                    // so snap down to 64/96/128 kbps.
+                    AVEncoderBitRateKey: NativeVideoCompressor.cappedBitrate(
+                        target: 128_000, sourceRate: audioTrack.estimatedDataRate, floor: 64_000) / 32_000 * 32_000
                 ]
                 audioInput = AVAssetWriterInput(mediaType: .audio, outputSettings: audioInputSettings)
                 if writer.canAdd(audioInput!) { writer.add(audioInput!) }
