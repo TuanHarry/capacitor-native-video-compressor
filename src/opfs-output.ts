@@ -2,14 +2,12 @@
  * WebCodecs output goes to the origin private file system so a long video
  * never sits whole in memory. The File handed back stays readable only while
  * its OPFS entry exists, and callers keep it well past `compressVideo` (until
- * the upload is done, or longer for a retry), so a successful output is never
- * deleted by this tab. Each tab writes under its own directory and holds a Web
- * Lock named after it for its whole life; every compress removes the
- * directories whose lock nobody holds any more, i.e. those of closed tabs.
- * A failed or cancelled job deletes its own file straight away.
- *
- * ponytail: outputs live until the tab closes. Upgrade path: an explicit
- * release call from the caller once it no longer needs the File.
+ * the upload is done, or longer for a retry), so a successful output stays
+ * until the caller releases it with `finishUpload({ jobId })` or the tab
+ * closes. Each tab writes under its own directory and holds a Web Lock named
+ * after it for its whole life; every compress removes the directories whose
+ * lock nobody holds any more, i.e. those of closed tabs. A failed or cancelled
+ * job deletes its own file straight away.
  */
 const OPFS_ROOT = 'native-video-compressor';
 const lockName = (tabId: string) => `${OPFS_ROOT}:${tabId}`;

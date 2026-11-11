@@ -25,6 +25,7 @@ import type {
 } from './definitions';
 import { CANCELLED, STORAGE_FULL, TOO_LARGE_FOR_WEB } from './definitions';
 import { createOpfsOutput } from './opfs-output';
+import type { OpfsOutput } from './opfs-output';
 
 type VideoQuality = NonNullable<CompressOptions['quality']>;
 
@@ -62,26 +63,31 @@ const MAX_FFMPEG_INPUT_BYTES = 200 * 1024 * 1024;
  * time (never upsampled). On WebCodecs audio is left to mediabunny, which
  * re-encodes to AAC for the MP4 container.
  */
-const QUALITY_LADDER: Record<VideoQuality, { shortSide: number; bitrate: number; crf: number; audioBitrate: string }> = {
-  VERY_HIGH: { shortSide: 1080, bitrate: 4000000, crf: 23, audioBitrate: '128k' },
-  HIGH: { shortSide: 720, bitrate: 2000000, crf: 28, audioBitrate: '128k' },
-  MEDIUM: { shortSide: 540, bitrate: 1200000, crf: 30, audioBitrate: '96k' },
-  LOW: { shortSide: 480, bitrate: 1000000, crf: 32, audioBitrate: '96k' },
-  '360P': { shortSide: 360, bitrate: 700000, crf: 28, audioBitrate: '64k' },
-  VERY_LOW: { shortSide: 240, bitrate: 350000, crf: 35, audioBitrate: '48k' },
-};
+const QUALITY_LADDER: Record<VideoQuality, { shortSide: number; bitrate: number; crf: number; audioBitrate: string }> =
+  {
+    VERY_HIGH: { shortSide: 1080, bitrate: 4000000, crf: 23, audioBitrate: '128k' },
+    HIGH: { shortSide: 720, bitrate: 2000000, crf: 28, audioBitrate: '128k' },
+    MEDIUM: { shortSide: 540, bitrate: 1200000, crf: 30, audioBitrate: '96k' },
+    LOW: { shortSide: 480, bitrate: 1000000, crf: 32, audioBitrate: '96k' },
+    '360P': { shortSide: 360, bitrate: 700000, crf: 28, audioBitrate: '64k' },
+    VERY_LOW: { shortSide: 240, bitrate: 350000, crf: 35, audioBitrate: '48k' },
+  };
 
 const WEBCODECS_QUANTIZER = 26;
 
 // Never upscales. Mediabunny derives the other side from the aspect ratio and rounds both up to even.
-export const webCodecsSize = (displayWidth: number, displayHeight: number, shortSide: number) => {
+export const webCodecsSize = (
+  displayWidth: number,
+  displayHeight: number,
+  shortSide: number,
+): { width: number } | { height: number } => {
   const side = Math.min(shortSide, displayWidth, displayHeight);
   return displayHeight > displayWidth ? { width: side } : { height: side };
 };
 
 // iw/ih are post-autorotate here: ffmpeg inserts the transpose ahead of -vf.
 // Never upscales; trunc keeps an odd source side even for libx264.
-export const ffmpegScaleFilter = (shortSide: number) =>
+export const ffmpegScaleFilter = (shortSide: number): string =>
   `scale=w='if(gt(iw,ih),-2,min(${shortSide},trunc(iw/2)*2))':h='if(gt(iw,ih),min(${shortSide},trunc(ih/2)*2),-2)'`;
 
 const FPS_CAP = 30;
@@ -90,11 +96,11 @@ const MIN_VIDEO_BITRATE = 200_000;
 
 // A lean source re-encoded at the tier bitrate comes out larger than it went in.
 // The floor stops a broken source estimate from producing an unwatchable file.
-export const capBitrate = (target: number, sourceBitrate: number | undefined, floor: number, headroom = 1) =>
+export const capBitrate = (target: number, sourceBitrate: number | undefined, floor: number, headroom = 1): number =>
   sourceBitrate && sourceBitrate > 0 ? Math.min(target, Math.max(floor, Math.round(sourceBitrate * headroom))) : target;
 
 // H.264 needs about 1.5x the bitrate of these codecs for the same picture.
-export const codecHeadroom = (codec: string | null | undefined) =>
+export const codecHeadroom = (codec: string | null | undefined): number =>
   codec === 'hevc' || codec === 'vp9' || codec === 'av1' ? 1.5 : 1;
 
 // Cap fps at 30, but never upsample. A failed probe leaves the source rate and bitrate untouched.
@@ -147,21 +153,25 @@ export class NativeVideoCompressorWeb extends WebPlugin implements NativeVideoCo
   /** The job `compressVideo` is running right now; a fresh object per call, so two calls never look alike. */
   private currentJob: { id: string } | null = null;
   private cancelRequested = false;
+  /** Kept OPFS outputs by jobId, deleted by `finishUpload`. */
+  private keptOutputs = new Map<string, OpfsOutput>();
 
   async initialize(): Promise<{ success: boolean; message?: string }> {
     // No-op: preloading the ~30 MB ffmpeg core would cost most compresses a download they never use.
     return { success: true, message: 'ready' };
   }
 
-  async finishUpload(): Promise<{ released: boolean }> {
-    // Nothing holds a process alive on the web — the tab either lives or the
-    // whole compress is gone with it. Resolving no-op so the one call site
-    // can fire unconditionally instead of branching on platform.
-    return { released: false };
+  async finishUpload({ jobId }: { jobId: string }): Promise<{ released: boolean }> {
+    const output = this.keptOutputs.get(jobId);
+    if (!output) return { released: false };
+    this.keptOutputs.delete(jobId);
+    await output.discard();
+    return { released: true };
   }
 
   async compressVideo(options: CompressOptions): Promise<CompressResult> {
     const job = { id: options.jobId ?? 'default' };
+    if (this.currentJob) this.stopEngines();
     this.currentJob = job;
     this.cancelRequested = false;
     // A job the caller gave up on (e.g. a stall timeout) runs on until its next
@@ -187,7 +197,7 @@ export class NativeVideoCompressorWeb extends WebPlugin implements NativeVideoCo
 
       if (await this.canUseWebCodecs(quality)) {
         try {
-          const result = await this.compressWithWebCodecs(blob, quality, throwIfCancelled);
+          const result = await this.compressWithWebCodecs(blob, quality, job.id, throwIfCancelled);
           if (result) return result;
         } catch (e: any) {
           if (e?.code === CANCELLED) throw e; // user cancel: never fall back
@@ -235,7 +245,11 @@ export class NativeVideoCompressorWeb extends WebPlugin implements NativeVideoCo
     // Set even when neither engine exists yet: the job may still be fetching
     // the source or inside loadFFmpeg, which read this flag at their boundaries.
     this.cancelRequested = true;
+    this.stopEngines();
+    return { cancelled: true };
+  }
 
+  private stopEngines() {
     const conversion = this.activeConversion;
     this.activeConversion = null;
     // Fire-and-forget: the CANCELLED error surfaces from the execute() rejection,
@@ -245,8 +259,6 @@ export class NativeVideoCompressorWeb extends WebPlugin implements NativeVideoCo
     this.ffmpeg?.terminate();
     this.ffmpeg = null;
     this.isLoaded = false;
-
-    return { cancelled: true };
   }
 
   private async fetchSourceBlob(sourcePath: string): Promise<Blob> {
@@ -274,10 +286,11 @@ export class NativeVideoCompressorWeb extends WebPlugin implements NativeVideoCo
   private async compressWithWebCodecs(
     blob: Blob,
     quality: VideoQuality,
+    jobId: string,
     throwIfCancelled: () => void,
   ): Promise<CompressResult | null> {
     const opfs = await createOpfsOutput();
-    console.log(`[compress] engine=webcodecs target=${opfs ? 'opfs' : 'buffer'}`);
+    console.debug(`[compress] engine=webcodecs target=${opfs ? 'opfs' : 'buffer'}`);
     let output: Output | undefined;
     let kept = false;
     try {
@@ -296,6 +309,7 @@ export class NativeVideoCompressorWeb extends WebPlugin implements NativeVideoCo
         outBlob = new Blob([buffer], { type: 'video/mp4' });
       }
       kept = true;
+      if (opfs) this.keptOutputs.set(jobId, opfs);
       return { success: true, destPath: URL.createObjectURL(outBlob) };
     } finally {
       if (!kept) {
@@ -382,7 +396,7 @@ export class NativeVideoCompressorWeb extends WebPlugin implements NativeVideoCo
     });
 
     instance.on('log', ({ message }) => {
-      console.log('[FFmpeg Log]', message);
+      console.debug('[FFmpeg Log]', message);
     });
 
     try {
@@ -424,7 +438,7 @@ export class NativeVideoCompressorWeb extends WebPlugin implements NativeVideoCo
     // narrowed here — surfacing a cancel as a TypeError, not a CANCELLED error.
     const ffmpeg = this.ffmpeg;
 
-    console.log('[compress] engine=ffmpeg');
+    console.debug('[compress] engine=ffmpeg');
     this.notifyListeners('onProgress', { status: 'started', percent: 0 });
 
     const inputFileName = 'input.mp4';

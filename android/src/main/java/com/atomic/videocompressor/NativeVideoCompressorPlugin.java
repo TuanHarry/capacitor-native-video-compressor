@@ -254,7 +254,8 @@ public class NativeVideoCompressorPlugin extends Plugin {
                 Long.parseLong(retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_BITRATE))
             );
         } catch (Exception e) {
-            Log.w(TAG, "Could not read video metadata, using LightCompressor defaults", e);
+            // Containers without a bitrate tag (MKV, WebM, screen recordings) still keep the tier's size.
+            Log.w(TAG, "Could not read video metadata, using LightCompressor defaults for the rest", e);
         } finally {
             // release() khai báo IOException từ API 29; không dùng
             // try-with-resources vì minSdk 24 chưa có AutoCloseable.
@@ -265,20 +266,19 @@ public class NativeVideoCompressorPlugin extends Plugin {
 
         // Với bitrate tính theo nguồn, quality chỉ còn chọn hệ số nhân của
         // LightCompressor; với Mbps tường minh hoặc metadata hỏng thì giữ MEDIUM.
-        VideoQuality videoQuality = bitrate != null && bitrate.mbps == null
-            ? QUALITY_BY_SOURCE_FACTOR[bitrate.sourceFactorIndex]
-            : VideoQuality.MEDIUM;
+        VideoQuality videoQuality =
+            bitrate != null && bitrate.mbps == null ? QUALITY_BY_SOURCE_FACTOR[bitrate.sourceFactorIndex] : VideoQuality.MEDIUM;
 
         Log.d(
             TAG,
             "Compress " +
-            qualityString +
-            ": size=" +
-            (size == null ? "default" : size[0] + "x" + size[1]) +
-            ", mbps=" +
-            (bitrate == null ? "default" : bitrate.mbps) +
-            ", quality=" +
-            videoQuality
+                qualityString +
+                ": size=" +
+                (size == null ? "default" : size[0] + "x" + size[1]) +
+                ", mbps=" +
+                (bitrate == null ? "default" : bitrate.mbps) +
+                ", quality=" +
+                videoQuality
         );
 
         // 2. Cấu hình thông số nén (Dành riêng cho LightCompressor 1.3.2)

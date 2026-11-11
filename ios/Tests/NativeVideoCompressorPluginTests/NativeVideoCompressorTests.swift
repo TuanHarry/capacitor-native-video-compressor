@@ -45,4 +45,15 @@ class NativeVideoCompressorTests: XCTestCase {
         XCTAssertEqual(NativeVideoCompressor.codecHeadroom(kCMVideoCodecType_HEVC), 1.5)
         XCTAssertEqual(NativeVideoCompressor.codecHeadroom(kCMVideoCodecType_H264), 1)
     }
+
+    func testOnlyFragmentNavigationsKeepTheJob() {
+        func isFragment(_ to: String, _ from: String) -> Bool {
+            NativeVideoCompressorPlugin.isFragmentNavigation(to: URL(string: to), from: URL(string: from))
+        }
+        XCTAssertTrue(isFragment("capacitor://localhost/feed#x", "capacitor://localhost/feed"))
+        XCTAssertTrue(isFragment("capacitor://localhost/feed#y", "capacitor://localhost/feed#x"))
+        XCTAssertFalse(isFragment("capacitor://localhost/feed", "capacitor://localhost/feed#x"))
+        XCTAssertFalse(isFragment("capacitor://localhost/feed", "capacitor://localhost/feed"))
+        XCTAssertFalse(isFragment("capacitor://localhost/other#x", "capacitor://localhost/feed"))
+    }
 }

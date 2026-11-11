@@ -16,14 +16,15 @@ public class NativeVideoCompressorTest {
 
     @Test
     public void outputSizeCapsShortSideAlignsTo16NeverUpscales() {
-        assertArrayEquals(new int[] { 960, 528 }, medium(1920, 1080));
-        assertArrayEquals(new int[] { 528, 960 }, medium(1080, 1920));
-        assertArrayEquals(new int[] { 960, 528 }, medium(3840, 2160));
-        assertArrayEquals(new int[] { 720, 528 }, medium(1440, 1080));
-        assertArrayEquals(new int[] { 640, 352 }, medium(640, 360));
-        assertArrayEquals(new int[] { 640, 352 }, medium(641, 361));
+        assertArrayEquals(new int[] { 944, 528 }, medium(1920, 1080));
+        assertArrayEquals(new int[] { 528, 944 }, medium(1080, 1920));
+        assertArrayEquals(new int[] { 944, 528 }, medium(3840, 2160));
+        assertArrayEquals(new int[] { 704, 528 }, medium(1440, 1080));
+        assertArrayEquals(new int[] { 624, 352 }, medium(640, 360));
+        assertArrayEquals(new int[] { 624, 352 }, medium(641, 361));
         assertArrayEquals(new int[] { 320, 176 }, medium(320, 180));
-        assertArrayEquals(new int[] { 1920, 1072 }, NativeVideoCompressor.outputSize(3840, 2160, 1080));
+        assertArrayEquals(new int[] { 1904, 1072 }, NativeVideoCompressor.outputSize(3840, 2160, 1080));
+        assertArrayEquals(new int[] { 992, 528 }, medium(1000, 528));
         assertNull(medium(0, 1080));
     }
 

@@ -98,6 +98,9 @@ export interface NativeVideoCompressorPlugin {
    * missed call leaves the device feeding an idle job until the hold expires.
    * `released` is false when no job by that id was still being held, which is
    * the normal outcome of a late or duplicate call, not an error.
+   *
+   * Web: deletes the compressed output instead, so call it only once the File
+   * is no longer needed (not before a retry).
    */
   finishUpload(options: { jobId: string }): Promise<{ released: boolean }>;
 

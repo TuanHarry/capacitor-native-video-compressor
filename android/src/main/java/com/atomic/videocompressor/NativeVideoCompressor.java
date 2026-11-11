@@ -69,15 +69,17 @@ public class NativeVideoCompressor {
      * track. `shortSide` caps the shorter side and the long side keeps the
      * aspect ratio. A 90/270 rotation only swaps the sides, and LightCompressor
      * swaps explicit dimensions itself for those, so coded order is right.
-     * Unlike iOS, both sides drop to a multiple of 16 (so 540 becomes 528).
+     * Unlike iOS, both sides are multiples of 16 (so 540 becomes 528). The long
+     * side follows the aligned short side and rounds to the nearest 16, so the
+     * aspect ratio drifts less than flooring each side on its own would.
      */
     static int[] outputSize(int width, int height, int shortSide) {
         int sourceShort = Math.min(width, height);
         if (sourceShort <= 0) return null;
         int sourceLong = Math.max(width, height);
-        int shortOut = Math.min(shortSide, sourceShort);
-        int outShort = align16(shortOut);
-        int outLong = align16((double) sourceLong * shortOut / sourceShort);
+        int outShort = align16(Math.min(shortSide, sourceShort));
+        long nearestLong = Math.round(((double) sourceLong * outShort) / sourceShort / 16) * 16;
+        int outLong = (int) Math.max(16, Math.min(nearestLong, align16(sourceLong)));
         return width >= height ? new int[] { outLong, outShort } : new int[] { outShort, outLong };
     }
 
