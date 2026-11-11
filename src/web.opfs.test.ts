@@ -1,4 +1,7 @@
+import { BufferTarget, Conversion, StreamTarget } from 'mediabunny';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+import { STORAGE_FULL } from './definitions';
 
 const mb = vi.hoisted(() => ({
   outputs: [] as any[],
@@ -9,9 +12,9 @@ const mb = vi.hoisted(() => ({
 
 vi.mock('@ffmpeg/ffmpeg', () => ({
   FFmpeg: class {
-    on() {}
+    on = vi.fn();
     load = async () => undefined;
-    terminate() {}
+    terminate = vi.fn();
     writeFile = async () => undefined;
     exec = async () => {
       mb.log.push('ffmpeg');
@@ -55,10 +58,6 @@ vi.mock('mediabunny', () => ({
   },
   Conversion: { init: vi.fn(async () => mb.conversion) },
 }));
-
-import { BufferTarget, Conversion, StreamTarget } from 'mediabunny';
-
-import { STORAGE_FULL } from './definitions';
 
 const fakeDir = (onKeys?: () => void) => {
   const entries = new Map<string, any>();
@@ -115,7 +114,15 @@ beforeEach(() => {
   mb.outputs.splice(0);
   mb.log.splice(0);
   mb.track = null;
-  mb.conversion = { isValid: true, discardedTracks: [], execute: async () => undefined };
+  mb.conversion = {
+    isValid: true,
+    discardedTracks: [],
+    // Like the real one, finalizing closes the output's writable.
+    execute: async () => {
+      const writable = mb.outputs[mb.outputs.length - 1]?.target.writable;
+      if (writable) writable.open = false;
+    },
+  };
   base = fakeDir();
   held = [];
   // Like Web Locks: requesting an exclusive lock that is already held waits for its release.
@@ -132,7 +139,10 @@ beforeEach(() => {
       query: async () => ({ held: held.map((name) => ({ name })) }),
     },
   });
-  vi.stubGlobal('fetch', vi.fn(async () => ({ blob: async () => new Blob(['v']) })));
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async () => ({ blob: async () => new Blob(['v']) })),
+  );
   vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:out');
 });
 
@@ -204,6 +214,18 @@ describe('NativeVideoCompressorWeb OPFS output', () => {
     expect(mb.outputs[2].target).toBeInstanceOf(StreamTarget);
     expect(onlyTabDir().entries.size).toBe(1);
   }, 2000);
+
+  it('finishUpload deletes the kept output of that job only once', async () => {
+    const { NativeVideoCompressorWeb } = await import('./web');
+    const plugin = new NativeVideoCompressorWeb();
+    await plugin.compressVideo({ sourcePath: 'blob:src', jobId: 'j' });
+    expect(onlyTabDir().entries.size).toBe(1);
+
+    expect(await plugin.finishUpload({ jobId: 'other' })).toEqual({ released: false });
+    expect(await plugin.finishUpload({ jobId: 'j' })).toEqual({ released: true });
+    expect(onlyTabDir().entries.size).toBe(0);
+    expect(await plugin.finishUpload({ jobId: 'j' })).toEqual({ released: false });
+  });
 
   it('an invalid conversion deletes its file and falls back to ffmpeg', async () => {
     mb.conversion = { isValid: false, discardedTracks: [] };

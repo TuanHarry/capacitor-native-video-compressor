@@ -164,7 +164,7 @@ Compressing a long video runs for minutes, so give the user a way out. Pass a
 `jobId` when starting, then cancel with the same id:
 
 ```typescript
-import { NativeVideoCompressor, CANCELLED } from 'capacitor-native-video-compressor';
+import { NativeVideoCompressor, CANCELLED, STORAGE_FULL, TOO_LARGE_FOR_WEB } from 'capacitor-native-video-compressor';
 
 const jobId = crypto.randomUUID();
 
@@ -178,6 +178,13 @@ try {
   if (error.code === CANCELLED) {
     // The user asked for this — no error toast, no retry prompt.
     return;
+  }
+  if (error.code === TOO_LARGE_FOR_WEB) {
+    // Web only: WebCodecs is unavailable or failed, and the file is over the 200 MB ffmpeg.wasm limit.
+    // Upload the original, or ask for a shorter clip.
+  }
+  if (error.code === STORAGE_FULL) {
+    // Web only: the browser storage quota is full. Retryable once space is freed.
   }
   throw error;
 }
@@ -205,7 +212,7 @@ different job was — it never throws.
 
 ### Quality Presets
 
-The `quality` parameter determines the output resolution and compression ratio. Depending on the original aspect ratio, the video will be scaled to match the following heights (or widths, preserving aspect ratio):
+The `quality` parameter determines the output resolution and compression ratio. Each tier caps the **short** side of the displayed video (the height of a landscape video, the width of a portrait one); the long side follows the aspect ratio. A source smaller than the tier is never upscaled. On Android both sides are rounded to multiples of 16, so 540 becomes 528.
 
 | Preset      | Target Resolution | Best For                                  |
 | ----------- | ----------------- | ----------------------------------------- |
@@ -216,7 +223,7 @@ The `quality` parameter determines the output resolution and compression ratio. 
 | `360P`      | ~ 360p            | Very small files                          |
 | `VERY_LOW`  | ~ 240p            | Extreme compression, noticeably pixelated |
 
-> **Note on Web Platform**: On Web, lower qualities also aggressively reduce the Audio Bitrate (down to 48kbps for VERY_LOW) to maximize space savings. On Native, audio maintains steady quality.
+> **Bitrate**: The video bitrate never goes above the source's own bitrate, so a lean source is not inflated; the Web ffmpeg fallback is the exception, as it uses CRF only (iOS and Web WebCodecs allow 1.5× the source for HEVC, VP9 and AV1, which need less than H.264 for the same picture). On Web, the ffmpeg fallback lowers the audio bitrate with the tier (down to 48 kbps for VERY_LOW). On iOS, AAC audio is capped at the source rate and snapped down to 64, 96 or 128 kbps.
 
 ### Platform Differences for `sourcePath`
 
@@ -298,6 +305,9 @@ Call it on every terminal branch of the upload, success or failure. A
 missed call leaves the device feeding an idle job until the hold expires.
 `released` is false when no job by that id was still being held, which is
 the normal outcome of a late or duplicate call, not an error.
+
+Web: deletes the compressed output instead, so call it only once the File
+is no longer needed (not before a retry).
 
 | Param         | Type                            |
 | ------------- | ------------------------------- |

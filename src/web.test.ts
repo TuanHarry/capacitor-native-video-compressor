@@ -1,5 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { TOO_LARGE_FOR_WEB } from './definitions';
+import { NativeVideoCompressorWeb, capBitrate, codecHeadroom, ffmpegScaleFilter, webCodecsSize } from './web';
+
 const m = vi.hoisted(() => ({ instances: [] as any[] }));
 
 vi.mock('@ffmpeg/ffmpeg', () => ({
@@ -24,9 +27,6 @@ vi.mock('@ffmpeg/ffmpeg', () => ({
 }));
 vi.mock('@ffmpeg/util', () => ({ toBlobURL: async (url: string) => url }));
 vi.mock('mediabunny', () => ({ canEncodeVideo: async () => false }));
-
-import { TOO_LARGE_FOR_WEB } from './definitions';
-import { NativeVideoCompressorWeb, capBitrate, codecHeadroom, ffmpegScaleFilter, webCodecsSize } from './web';
 
 const start = async (plugin: NativeVideoCompressorWeb, jobId?: string) => {
   const before = m.instances.length;
@@ -98,6 +98,25 @@ describe('NativeVideoCompressorWeb: an abandoned job followed by a new one', () 
       code: TOO_LARGE_FOR_WEB,
     });
     expect(m.instances).toHaveLength(0);
+  });
+
+  it('a new compress stops the engine of the job it supersedes', async () => {
+    const plugin = new NativeVideoCompressorWeb();
+    const stale = await start(plugin, 'A');
+    // Like ffmpeg.wasm: terminate() rejects the exec in flight.
+    stale.ffmpeg.exec.mockImplementation(
+      () =>
+        new Promise((_, reject) => stale.ffmpeg.terminate.mockImplementation(() => reject(new Error('terminated')))),
+    );
+    stale.ffmpeg.finishLoad();
+    await vi.waitFor(() => expect(stale.ffmpeg.exec).toHaveBeenCalled());
+
+    const live = await start(plugin, 'B');
+    expect(stale.ffmpeg.terminate).toHaveBeenCalled();
+    await expect(stale.run).rejects.toMatchObject({ code: 'CANCELLED' });
+
+    live.ffmpeg.finishLoad();
+    await expect(live.run).resolves.toEqual({ success: true, destPath: 'blob:out' });
   });
 
   it('two jobs without a jobId: the abandoned one neither runs on nor clears the new one', async () => {

@@ -74,12 +74,20 @@ public class NativeVideoCompressorPlugin: CAPPlugin, CAPBridgedPlugin {
     override public func shouldOverrideLoad(_ navigationAction: WKNavigationAction) -> NSNumber? {
         if navigationAction.targetFrame?.isMainFrame == true,
            navigationAction.navigationType == .reload
-            || navigationAction.request.url?.host == bridge?.webView?.url?.host {
+            || (navigationAction.request.url?.host == bridge?.webView?.url?.host
+                && !Self.isFragmentNavigation(to: navigationAction.request.url, from: bridge?.webView?.url)) {
             stateLock.lock()
             currentJob?.isCancelled = true
             stateLock.unlock()
         }
         return nil
+    }
+
+    // Only a target with a fragment stays in the document; dropping the fragment reloads the page.
+    static func isFragmentNavigation(to target: URL?, from current: URL?) -> Bool {
+        guard let target = target, let current = current, target.fragment != nil else { return false }
+        return target.absoluteString.split(separator: "#", maxSplits: 1).first
+            == current.absoluteString.split(separator: "#", maxSplits: 1).first
     }
 
     @objc func compressVideo(_ call: CAPPluginCall) {
@@ -105,8 +113,6 @@ public class NativeVideoCompressorPlugin: CAPPlugin, CAPBridgedPlugin {
         // Short side of the displayed picture, matching the web QUALITY_LADDER.
         var shortSide: Int
         var targetBitrate: Int // Bitrate càng thấp file càng nhẹ
-
-        print("====== VIDEO COMPRESSION QUALITY: \(qualityStr) ======")
 
         switch qualityStr {
         case "VERY_HIGH":

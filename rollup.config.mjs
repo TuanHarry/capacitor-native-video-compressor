@@ -1,3 +1,5 @@
+const external = ['@capacitor/core', '@ffmpeg/ffmpeg', '@ffmpeg/util', 'mediabunny'];
+
 export default {
   input: 'dist/esm/index.js',
   output: [
@@ -7,6 +9,9 @@ export default {
       name: 'capacitorNativeVideoCompressor',
       globals: {
         '@capacitor/core': 'capacitorExports',
+        '@ffmpeg/ffmpeg': 'FFmpegWASM',
+        '@ffmpeg/util': 'FFmpegUtil',
+        mediabunny: 'Mediabunny',
       },
       sourcemap: true,
       inlineDynamicImports: true,
@@ -18,5 +23,5 @@ export default {
       inlineDynamicImports: true,
     },
   ],
-  external: ['@capacitor/core'],
+  external,
 };
