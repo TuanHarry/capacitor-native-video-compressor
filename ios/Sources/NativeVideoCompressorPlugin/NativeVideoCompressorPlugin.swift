@@ -2,6 +2,7 @@ import Foundation
 import Capacitor
 import AVFoundation
 import UIKit
+import WebKit
 
 @objc(NativeVideoCompressorPlugin)
 public class NativeVideoCompressorPlugin: CAPPlugin, CAPBridgedPlugin {
@@ -18,13 +19,18 @@ public class NativeVideoCompressorPlugin: CAPPlugin, CAPBridgedPlugin {
         CAPPluginMethod(name: "initialize", returnType: CAPPluginReturnPromise),
     ]
 
+    /// One compress with its own flag, so cancelling an orphaned job can't
+    /// cancel (or un-cancel) the job that replaced it.
+    private final class Job {
+        let id: String
+        var isCancelled = false
+        init(id: String) { self.id = id }
+    }
+
     /// The job `compressVideo` is running right now, for `cancel(jobId:)`.
-    private var currentJobId: String?
-    private var isCancelled = false
-    /// Held only so `cancel` can stop it; the compress owns it otherwise.
-    private var currentReader: AVAssetReader?
-    /// Guards the three fields above — `cancel` arrives on the main thread
-    /// while the reader is being driven from the compression queues.
+    private var currentJob: Job?
+    /// Guards `currentJob` and every `Job.isCancelled` — `cancel` arrives on the
+    /// main thread while the reader is being driven from the compression queues.
     private let stateLock = NSLock()
 
     /// Nothing to do natively; AVFoundation needs no warm-up. Answered rather
@@ -36,28 +42,44 @@ public class NativeVideoCompressorPlugin: CAPPlugin, CAPBridgedPlugin {
     /**
      * Stop the running compress.
      *
-     * `cancelReading()` is all it takes: the frame loops below already check
-     * `reader.status == .reading` every pass, so a cancelled reader sends them
-     * down the `else` branch — `markAsFinished()`, `group.leave()` — and the
-     * existing completion handler runs. No new exit path, no polling.
+     * Only raises the flag. Calling `cancelReading()` from here tore the reader
+     * down while a frame loop was inside `copyNextSampleBuffer()` on its own
+     * queue and crashed (`_os_unfair_lock_corruption_abort`). The loops check
+     * the flag before every read and finish themselves; the completion handler
+     * cancels the reader once neither loop can touch it.
      */
     @objc func cancel(_ call: CAPPluginCall) {
         stateLock.lock()
-        let running = currentJobId
         let requested = call.getString("jobId")
         // A cancel for a job that isn't the one running would otherwise kill
         // an unrelated caller's compress — there is only ever one.
-        guard let running = running, requested == nil || requested == running else {
+        guard let running = currentJob, requested == nil || requested == running.id else {
             stateLock.unlock()
             call.resolve(["cancelled": false])
             return
         }
-        isCancelled = true
-        let reader = currentReader
+        running.isCancelled = true
         stateLock.unlock()
 
-        reader?.cancelReading()
         call.resolve(["cancelled": true])
+    }
+
+    /**
+     * Capacitor iOS resets the bridge on every main-frame navigation but has no
+     * plugin hook for it, so this is the closest one. A reload (pull-to-refresh,
+     * web content process restart) or any same-origin page load ends the JS
+     * session that owns the job; left running it encodes for nobody while the
+     * new session starts its own. Returning nil keeps Capacitor's own policy.
+     */
+    override public func shouldOverrideLoad(_ navigationAction: WKNavigationAction) -> NSNumber? {
+        if navigationAction.targetFrame?.isMainFrame == true,
+           navigationAction.navigationType == .reload
+            || navigationAction.request.url?.host == bridge?.webView?.url?.host {
+            stateLock.lock()
+            currentJob?.isCancelled = true
+            stateLock.unlock()
+        }
+        return nil
     }
 
     @objc func compressVideo(_ call: CAPPluginCall) {
@@ -66,9 +88,12 @@ public class NativeVideoCompressorPlugin: CAPPlugin, CAPBridgedPlugin {
             return
         }
 
+        let job = Job(id: call.getString("jobId") ?? "default")
         stateLock.lock()
-        currentJobId = call.getString("jobId") ?? "default"
-        isCancelled = false
+        // The app runs one compress at a time, so a job still here was orphaned
+        // by a JS session the shouldOverrideLoad hook missed.
+        currentJob?.isCancelled = true
+        currentJob = job
         stateLock.unlock()
 
         let videoURL = sourcePath.hasPrefix("file://") ? URL(string: sourcePath)! : URL(fileURLWithPath: sourcePath)
@@ -77,27 +102,27 @@ public class NativeVideoCompressorPlugin: CAPPlugin, CAPBridgedPlugin {
         let qualityStr = call.getString("quality") ?? "MEDIUM"
         
         // 1. Định nghĩa Kích thước và Bitrate (Quyết định dung lượng file)
-        var targetWidth: CGFloat
-        var targetHeight: CGFloat
+        // Short side of the displayed picture, matching the web QUALITY_LADDER.
+        var shortSide: Int
         var targetBitrate: Int // Bitrate càng thấp file càng nhẹ
-        
+
         print("====== VIDEO COMPRESSION QUALITY: \(qualityStr) ======")
-        
+
         switch qualityStr {
         case "VERY_HIGH":
-            targetWidth = 1920; targetHeight = 1080; targetBitrate = 4_500_000 // ~4.5 Mbps
+            shortSide = 1080; targetBitrate = 4_500_000 // ~4.5 Mbps
         case "HIGH":
-            targetWidth = 1280; targetHeight = 720; targetBitrate = 2_500_000 // ~2.5 Mbps
+            shortSide = 720; targetBitrate = 2_500_000 // ~2.5 Mbps
         case "MEDIUM":
-            targetWidth = 960; targetHeight = 540; targetBitrate = 1_500_000 // ~1.5 Mbps (Giảm dung lượng cực tốt)
+            shortSide = 540; targetBitrate = 1_500_000 // ~1.5 Mbps (Giảm dung lượng cực tốt)
         case "LOW":
-            targetWidth = 640; targetHeight = 480; targetBitrate = 1_000_000 // ~1.0 Mbps
+            shortSide = 480; targetBitrate = 1_000_000 // ~1.0 Mbps
         case "360P":
-            targetWidth = 640; targetHeight = 360; targetBitrate = 700_000 // ~0.7 Mbps
+            shortSide = 360; targetBitrate = 700_000 // ~0.7 Mbps
         case "VERY_LOW":
-            targetWidth = 426; targetHeight = 240; targetBitrate = 400_000 // ~0.4 Mbps
+            shortSide = 240; targetBitrate = 400_000 // ~0.4 Mbps
         default:
-            targetWidth = 960; targetHeight = 540; targetBitrate = 1_500_000
+            shortSide = 540; targetBitrate = 1_500_000
         }
         
         let asset = AVAsset(url: videoURL)
@@ -113,9 +138,9 @@ public class NativeVideoCompressorPlugin: CAPPlugin, CAPBridgedPlugin {
         // 2. Gọi hàm nén Custom bằng AVAssetWriter
         self.compressWithAVAssetWriter(
             asset: asset,
+            job: job,
             outputURL: outputURL,
-            targetWidth: targetWidth,
-            targetHeight: targetHeight,
+            shortSide: shortSide,
             targetBitrate: targetBitrate,
             call: call,
             backgroundTask: backgroundTask
@@ -125,15 +150,16 @@ public class NativeVideoCompressorPlugin: CAPPlugin, CAPBridgedPlugin {
     // MARK: - Core Compression Logic (AVAssetWriter)
     private func compressWithAVAssetWriter(
         asset: AVAsset,
+        job: Job,
         outputURL: URL,
-        targetWidth: CGFloat,
-        targetHeight: CGFloat,
+        shortSide: Int,
         targetBitrate: Int,
         call: CAPPluginCall,
         backgroundTask: UIBackgroundTaskIdentifier
     ) {
-        guard let videoTrack = asset.tracks(withMediaType: .video).first else {
-            clearJobState()
+        guard let videoTrack = asset.tracks(withMediaType: .video).first,
+              let outputSize = NativeVideoCompressor.outputSize(naturalSize: videoTrack.naturalSize, shortSide: shortSide) else {
+            clearJobState(job)
             call.reject("Không tìm thấy track video")
             return
         }
@@ -144,48 +170,45 @@ public class NativeVideoCompressorPlugin: CAPPlugin, CAPBridgedPlugin {
             let writer = try AVAssetWriter(url: outputURL, fileType: .mp4)
             writer.shouldOptimizeForNetworkUse = true // Tối ưu cho Web/Network
 
-            stateLock.lock()
-            currentReader = reader
-            // A cancel that landed between compressVideo and here has nothing
-            // to call cancelReading() on, so honour it before any work starts.
-            let cancelledEarly = isCancelled
-            stateLock.unlock()
-
-            if cancelledEarly {
-                finishCancelled(outputURL: outputURL, call: call, backgroundTask: backgroundTask)
+            // A cancel that landed before the loops start would otherwise only
+            // be noticed after the writer had started, so honour it now.
+            if cancelRequested(job) {
+                finishCancelled(job: job, outputURL: outputURL, call: call, backgroundTask: backgroundTask)
                 return
             }
             
-            // --- XỬ LÝ KÍCH THƯỚC VÀ CHIỀU XOAY (ORIENTATION) ---
-            let naturalSize = videoTrack.naturalSize
             let transform = videoTrack.preferredTransform
-            
-            // Tính toán chiều thực tế khi hiển thị
-            var visualSize = naturalSize.applying(transform)
-            visualSize.width = abs(visualSize.width)
-            visualSize.height = abs(visualSize.height)
-            
-            let isVisualPortrait = visualSize.height > visualSize.width
-            let boundingWidth = isVisualPortrait ? min(targetWidth, targetHeight) : max(targetWidth, targetHeight)
-            let boundingHeight = isVisualPortrait ? max(targetWidth, targetHeight) : min(targetWidth, targetHeight)
-            
-            let isNaturalPortrait = naturalSize.height > naturalSize.width
-            let outputWidth = isNaturalPortrait ? min(boundingWidth, boundingHeight) : max(boundingWidth, boundingHeight)
-            let outputHeight = isNaturalPortrait ? max(boundingWidth, boundingHeight) : min(boundingWidth, boundingHeight)
-            
+            let sourceCodec = videoTrack.formatDescriptions.first
+                .map { CMFormatDescriptionGetMediaSubType($0 as! CMFormatDescription) } ?? 0
+
             // --- CẤU HÌNH VIDEO ---
+            // Decoder and H.264 encoder both work in YUV 4:2:0; asking for BGRA cost two colour conversions per frame.
             let videoOutputSettings: [String: Any] = [
-                kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA)
+                kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
             ]
             let videoOutput = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: videoOutputSettings)
+            // Each buffer goes straight to the writer and is never mutated, so the per-sample copy is wasted work.
+            videoOutput.alwaysCopiesSampleData = false
             if reader.canAdd(videoOutput) { reader.add(videoOutput) }
             
             let videoInputSettings:[String: Any] = [
                 AVVideoCodecKey: AVVideoCodecType.h264,
-                AVVideoWidthKey: Int(outputWidth),
-                AVVideoHeightKey: Int(outputHeight),
+                AVVideoWidthKey: outputSize.width,
+                AVVideoHeightKey: outputSize.height,
+                // The default mode is Resize, which stretches. The size already matches the source aspect
+                // within even-rounding, so Fill only crops that sub-pixel instead of adding a black line (ResizeAspect).
+                AVVideoScalingModeKey: AVVideoScalingModeResizeAspectFill,
+                // 8-bit H.264 can't carry HDR: without this an HLG/PQ source keeps its BT.2020 tags on SDR-range data.
+                // The writer colour-converts (tone-maps) tagged buffers to these properties; BT.709 sources pass through unchanged.
+                AVVideoColorPropertiesKey: [
+                    AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
+                    AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
+                    AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2
+                ],
                 AVVideoCompressionPropertiesKey:[
-                    AVVideoAverageBitRateKey: targetBitrate, // ÉP BITRATE TẠI ĐÂY
+                    AVVideoAverageBitRateKey: NativeVideoCompressor.cappedBitrate(
+                        target: targetBitrate, sourceRate: videoTrack.estimatedDataRate, floor: 200_000,
+                        headroom: NativeVideoCompressor.codecHeadroom(sourceCodec)),
                     AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel
                 ]
             ]
@@ -199,14 +222,19 @@ public class NativeVideoCompressorPlugin: CAPPlugin, CAPBridgedPlugin {
             
             if let audioTrack = audioTrack {
                 let audioOutputSettings:[String: Any] = [AVFormatIDKey: kAudioFormatLinearPCM]
-                audioOutput = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: audioOutputSettings)
-                if reader.canAdd(audioOutput!) { reader.add(audioOutput!) }
+                let output = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: audioOutputSettings)
+                output.alwaysCopiesSampleData = false
+                if reader.canAdd(output) { reader.add(output) }
+                audioOutput = output
                 
                 let audioInputSettings:[String: Any] = [
                     AVFormatIDKey: kAudioFormatMPEG4AAC,
                     AVNumberOfChannelsKey: 2,
                     AVSampleRateKey: 44100,
-                    AVEncoderBitRateKey: 128000 // Audio nén về 128kbps
+                    // AAC takes only discrete rates and AVAssetWriterInput raises on an unsupported one,
+                    // so snap down to 64/96/128 kbps.
+                    AVEncoderBitRateKey: NativeVideoCompressor.cappedBitrate(
+                        target: 128_000, sourceRate: audioTrack.estimatedDataRate, floor: 64_000) / 32_000 * 32_000
                 ]
                 audioInput = AVAssetWriterInput(mediaType: .audio, outputSettings: audioInputSettings)
                 if writer.canAdd(audioInput!) { writer.add(audioInput!) }
@@ -229,7 +257,7 @@ public class NativeVideoCompressorPlugin: CAPPlugin, CAPBridgedPlugin {
             videoInput.requestMediaDataWhenReady(on: videoQueue) {
                 while videoInput.isReadyForMoreMediaData {
                     autoreleasepool {
-                        if reader.status == .reading, let buffer = videoOutput.copyNextSampleBuffer() {
+                        if !self.cancelRequested(job), reader.status == .reading, let buffer = videoOutput.copyNextSampleBuffer() {
                             videoInput.append(buffer)
                             
                             // Tính toán Progress
@@ -262,7 +290,7 @@ public class NativeVideoCompressorPlugin: CAPPlugin, CAPBridgedPlugin {
                 aInput.requestMediaDataWhenReady(on: audioQueue) {
                     while aInput.isReadyForMoreMediaData {
                         autoreleasepool {
-                            if reader.status == .reading, let buffer = aOutput.copyNextSampleBuffer() {
+                            if !self.cancelRequested(job), reader.status == .reading, let buffer = aOutput.copyNextSampleBuffer() {
                                 aInput.append(buffer)
                             } else {
                                 aInput.markAsFinished()
@@ -280,13 +308,13 @@ public class NativeVideoCompressorPlugin: CAPPlugin, CAPBridgedPlugin {
                 }
 
                 self.stateLock.lock()
-                let wasCancelled = self.isCancelled
-                self.currentReader = nil
-                self.currentJobId = nil
-                self.isCancelled = false
+                let wasCancelled = job.isCancelled
+                if self.currentJob === job { self.currentJob = nil }
                 self.stateLock.unlock()
 
                 if wasCancelled {
+                    // Both loops have left the group, so nothing else is reading.
+                    reader.cancelReading()
                     writer.cancelWriting()
                     try? FileManager.default.removeItem(at: outputURL)
                     call.reject("Đã hủy nén", NativeVideoCompressorPlugin.cancelledCode)
@@ -314,13 +342,14 @@ public class NativeVideoCompressorPlugin: CAPPlugin, CAPBridgedPlugin {
             }
 
         } catch {
-            clearJobState()
+            clearJobState(job)
             call.reject("Lỗi khởi tạo bộ nén: \(error.localizedDescription)")
         }
     }
 
     /// Cancelled before the reader started — nothing to stop, just clean up.
     private func finishCancelled(
+        job: Job,
         outputURL: URL,
         call: CAPPluginCall,
         backgroundTask: UIBackgroundTaskIdentifier
@@ -328,16 +357,20 @@ public class NativeVideoCompressorPlugin: CAPPlugin, CAPBridgedPlugin {
         if backgroundTask != .invalid {
             UIApplication.shared.endBackgroundTask(backgroundTask)
         }
-        clearJobState()
+        clearJobState(job)
         try? FileManager.default.removeItem(at: outputURL)
         call.reject("Đã hủy nén", NativeVideoCompressorPlugin.cancelledCode)
     }
 
-    private func clearJobState() {
+    private func cancelRequested(_ job: Job) -> Bool {
         stateLock.lock()
-        currentReader = nil
-        currentJobId = nil
-        isCancelled = false
+        defer { stateLock.unlock() }
+        return job.isCancelled
+    }
+
+    private func clearJobState(_ job: Job) {
+        stateLock.lock()
+        if currentJob === job { currentJob = nil }
         stateLock.unlock()
     }
 

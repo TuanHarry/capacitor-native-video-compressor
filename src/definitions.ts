@@ -7,6 +7,22 @@ import type { PluginListenerHandle } from '@capacitor/core';
  */
 export const CANCELLED = 'CANCELLED';
 
+/**
+ * `code` on the error `compressVideo` rejects with on web when WebCodecs can't
+ * encode the video and it is larger than 200 MB, the cap for the ffmpeg.wasm
+ * fallback. ffmpeg.wasm copies the whole input into wasm memory (~2 GB
+ * ceiling), so a large file there crashes or hangs the tab rather than failing
+ * cleanly.
+ */
+export const TOO_LARGE_FOR_WEB = 'TOO_LARGE_FOR_WEB';
+
+/**
+ * `code` on the error `compressVideo` rejects with on web when the browser
+ * refuses to store more of the output (storage quota). Retryable once space
+ * is freed.
+ */
+export const STORAGE_FULL = 'STORAGE_FULL';
+
 export interface CompressOptions {
   sourcePath: string;
   destPath?: string;

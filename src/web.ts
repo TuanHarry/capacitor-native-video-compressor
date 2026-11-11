@@ -11,8 +11,10 @@ import {
   Mp4OutputFormat,
   Output,
   Quality,
+  StreamTarget,
   canEncodeVideo,
 } from 'mediabunny';
+import type { InputVideoTrack } from 'mediabunny';
 
 import type {
   NativeVideoCompressorPlugin,
@@ -21,41 +23,93 @@ import type {
   CancelOptions,
   CancelResult,
 } from './definitions';
-import { CANCELLED } from './definitions';
+import { CANCELLED, STORAGE_FULL, TOO_LARGE_FOR_WEB } from './definitions';
+import { createOpfsOutput } from './opfs-output';
 
 type VideoQuality = NonNullable<CompressOptions['quality']>;
 
 /**
- * Rejection shape for a cancelled compress. `code` matches what `call.reject`
+ * Rejection shape for every coded failure. `code` matches what `call.reject`
  * puts on the error object on iOS/Android, so one `error.code === 'CANCELLED'`
- * check works on every platform — and on both web engines below.
+ * check works on every platform and on both web engines below.
  */
-class CancelledError extends Error {
-  code = CANCELLED;
-  constructor() {
-    super('Đã hủy nén');
-    this.name = 'CancelledError';
+class CompressError extends Error {
+  constructor(
+    public code: string,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'CompressError';
   }
 }
 
+const cancelledError = () => new CompressError(CANCELLED, 'Đã hủy nén');
+
+const isQuotaError = (e: unknown): boolean => {
+  const { name, cause } = (e ?? {}) as { name?: unknown; cause?: unknown };
+  return name === 'QuotaExceededError' || (!!cause && isQuotaError(cause));
+};
+
+/** ffmpeg.wasm copies the whole input into wasm memory (~2 GB ceiling). */
+const MAX_FFMPEG_INPUT_BYTES = 200 * 1024 * 1024;
+
 /**
- * WebCodecs target per quality tier: cap height + a bitrate ceiling. The
- * quantizer (constant 26, CRF-like) drives quality where the encoder honours
- * it; H.264 on most browsers is bitrate-driven, so `bitrate` is the real knob.
- * fps is capped to 30 at call time (never upsampled). Audio is left to
- * mediabunny, which re-encodes to AAC for the MP4 container.
+ * Per quality tier. `shortSide` caps the shorter display side, so portrait and
+ * landscape get the same box as on iOS. WebCodecs: that + a bitrate ceiling; the quantizer
+ * (constant 26, CRF-like) drives quality where the encoder honours it, but
+ * H.264 on most browsers is bitrate-driven, so `bitrate` is the real knob.
+ * ffmpeg: same short side, `crf` and `audioBitrate`. fps is capped to 30 at call
+ * time (never upsampled). On WebCodecs audio is left to mediabunny, which
+ * re-encodes to AAC for the MP4 container.
  */
-const WEBCODECS_LADDER: Record<VideoQuality, { height: number; bitrate: number }> = {
-  VERY_HIGH: { height: 1080, bitrate: 4000000 },
-  HIGH: { height: 720, bitrate: 2000000 },
-  MEDIUM: { height: 540, bitrate: 1200000 },
-  LOW: { height: 480, bitrate: 1000000 },
-  '360P': { height: 360, bitrate: 700000 },
-  VERY_LOW: { height: 240, bitrate: 350000 },
+const QUALITY_LADDER: Record<VideoQuality, { shortSide: number; bitrate: number; crf: number; audioBitrate: string }> = {
+  VERY_HIGH: { shortSide: 1080, bitrate: 4000000, crf: 23, audioBitrate: '128k' },
+  HIGH: { shortSide: 720, bitrate: 2000000, crf: 28, audioBitrate: '128k' },
+  MEDIUM: { shortSide: 540, bitrate: 1200000, crf: 30, audioBitrate: '96k' },
+  LOW: { shortSide: 480, bitrate: 1000000, crf: 32, audioBitrate: '96k' },
+  '360P': { shortSide: 360, bitrate: 700000, crf: 28, audioBitrate: '64k' },
+  VERY_LOW: { shortSide: 240, bitrate: 350000, crf: 35, audioBitrate: '48k' },
 };
 
 const WEBCODECS_QUANTIZER = 26;
+
+// Never upscales. Mediabunny derives the other side from the aspect ratio and rounds both up to even.
+export const webCodecsSize = (displayWidth: number, displayHeight: number, shortSide: number) => {
+  const side = Math.min(shortSide, displayWidth, displayHeight);
+  return displayHeight > displayWidth ? { width: side } : { height: side };
+};
+
+// iw/ih are post-autorotate here: ffmpeg inserts the transpose ahead of -vf.
+// Never upscales; trunc keeps an odd source side even for libx264.
+export const ffmpegScaleFilter = (shortSide: number) =>
+  `scale=w='if(gt(iw,ih),-2,min(${shortSide},trunc(iw/2)*2))':h='if(gt(iw,ih),min(${shortSide},trunc(ih/2)*2),-2)'`;
+
 const FPS_CAP = 30;
+
+const MIN_VIDEO_BITRATE = 200_000;
+
+// A lean source re-encoded at the tier bitrate comes out larger than it went in.
+// The floor stops a broken source estimate from producing an unwatchable file.
+export const capBitrate = (target: number, sourceBitrate: number | undefined, floor: number, headroom = 1) =>
+  sourceBitrate && sourceBitrate > 0 ? Math.min(target, Math.max(floor, Math.round(sourceBitrate * headroom))) : target;
+
+// H.264 needs about 1.5x the bitrate of these codecs for the same picture.
+export const codecHeadroom = (codec: string | null | undefined) =>
+  codec === 'hevc' || codec === 'vp9' || codec === 'av1' ? 1.5 : 1;
+
+// Cap fps at 30, but never upsample. A failed probe leaves the source rate and bitrate untouched.
+const probeVideoStats = async (track: InputVideoTrack | null): Promise<{ frameRate?: number; bitrate?: number }> => {
+  try {
+    const stats = await track?.computePacketStats(100);
+    if (!stats) return {};
+    return {
+      frameRate: stats.averagePacketRate > 0 ? Math.min(FPS_CAP, Math.round(stats.averagePacketRate)) : undefined,
+      bitrate: stats.averageBitrate,
+    };
+  } catch {
+    return {};
+  }
+};
 
 const CORE_BASE_URL = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm';
 
@@ -90,15 +144,12 @@ export class NativeVideoCompressorWeb extends WebPlugin implements NativeVideoCo
   private isLoaded = false;
   /** The mediabunny conversion running now, so `cancel()` can abort it. */
   private activeConversion: Conversion | null = null;
-  /** The job `compressVideo` is running right now, for `cancel({ jobId })`. */
-  private currentJobId: string | null = null;
+  /** The job `compressVideo` is running right now; a fresh object per call, so two calls never look alike. */
+  private currentJob: { id: string } | null = null;
   private cancelRequested = false;
 
   async initialize(): Promise<{ success: boolean; message?: string }> {
-    // WebCodecs (the primary path) needs no core download, so there is nothing
-    // to warm. Eagerly loading the ffmpeg core here would pull ~30 MB for a
-    // path most compresses never take. The fallback lazy-loads its core on
-    // first use. Kept as a resolving no-op so callers that await it still pass.
+    // No-op: preloading the ~30 MB ffmpeg core would cost most compresses a download they never use.
     return { success: true, message: 'ready' };
   }
 
@@ -110,15 +161,20 @@ export class NativeVideoCompressorWeb extends WebPlugin implements NativeVideoCo
   }
 
   async compressVideo(options: CompressOptions): Promise<CompressResult> {
-    this.currentJobId = options.jobId ?? 'default';
+    const job = { id: options.jobId ?? 'default' };
+    this.currentJob = job;
     this.cancelRequested = false;
+    // A job the caller gave up on (e.g. a stall timeout) runs on until its next
+    // await returns. Once another job has started, the shared flags above speak
+    // for that job, not this one, so a superseded job counts as cancelled.
+    const isSuperseded = () => this.currentJob !== job;
 
     // Checked at every stage boundary, not just around the encode: cancelling
     // an engine only reaches work already handed to it, so a cancel during the
     // source fetch or before init has nothing to interrupt and would otherwise
     // let the compress carry on as if nothing had happened.
     const throwIfCancelled = () => {
-      if (this.cancelRequested) throw new CancelledError();
+      if (this.cancelRequested || isSuperseded()) throw cancelledError();
     };
 
     try {
@@ -133,14 +189,17 @@ export class NativeVideoCompressorWeb extends WebPlugin implements NativeVideoCo
         try {
           const result = await this.compressWithWebCodecs(blob, quality, throwIfCancelled);
           if (result) return result;
-          // null → conversion invalid / tracks discarded → fall back to ffmpeg.
         } catch (e: any) {
           if (e?.code === CANCELLED) throw e; // user cancel: never fall back
+          // Not to ffmpeg either: it needs even more room, and its size cap would misreport this as TOO_LARGE_FOR_WEB.
+          if (isQuotaError(e)) throw new CompressError(STORAGE_FULL, 'Không đủ dung lượng lưu trữ để nén video');
           console.warn('[compress] WebCodecs failed, falling back to ffmpeg:', e);
-          throwIfCancelled();
         }
       }
 
+      throwIfCancelled();
+      if (blob.size > MAX_FFMPEG_INPUT_BYTES)
+        throw new CompressError(TOO_LARGE_FOR_WEB, 'Video quá lớn để nén trên trình duyệt này');
       return await this.compressWithFfmpeg(blob, quality, throwIfCancelled);
     } catch (error: any) {
       if (error?.code === CANCELLED) {
@@ -150,9 +209,11 @@ export class NativeVideoCompressorWeb extends WebPlugin implements NativeVideoCo
       }
       throw error;
     } finally {
-      this.currentJobId = null;
-      this.cancelRequested = false;
-      this.activeConversion = null;
+      if (!isSuperseded()) {
+        this.currentJob = null;
+        this.cancelRequested = false;
+        this.activeConversion = null;
+      }
     }
   }
 
@@ -161,15 +222,15 @@ export class NativeVideoCompressorWeb extends WebPlugin implements NativeVideoCo
    * so acting on both is safe.
    *
    * WebCodecs: `conversion.cancel()` makes the in-flight `execute()` reject
-   * with `ConversionCanceledError`, surfaced as a `CancelledError` below.
+   * with `ConversionCanceledError`, surfaced as a CANCELLED `CompressError` below.
    * ffmpeg: `exec()` runs synchronously inside the worker and never reaches a
    * message poll while encoding, so `worker.terminate()` is the only way to
    * stop it — its cost is the loaded core, which is why the core URLs are
    * cached above.
    */
   async cancel(options?: CancelOptions): Promise<CancelResult> {
-    if (!this.currentJobId) return { cancelled: false };
-    if (options?.jobId && options.jobId !== this.currentJobId) return { cancelled: false };
+    if (!this.currentJob) return { cancelled: false };
+    if (options?.jobId && options.jobId !== this.currentJob.id) return { cancelled: false };
 
     // Set even when neither engine exists yet: the job may still be fetching
     // the source or inside loadFFmpeg, which read this flag at their boundaries.
@@ -177,7 +238,7 @@ export class NativeVideoCompressorWeb extends WebPlugin implements NativeVideoCo
 
     const conversion = this.activeConversion;
     this.activeConversion = null;
-    // Fire-and-forget: the CancelledError surfaces from the execute() rejection,
+    // Fire-and-forget: the CANCELLED error surfaces from the execute() rejection,
     // not from here; awaiting would only make cancel() slower.
     conversion?.cancel().catch(() => undefined);
 
@@ -200,8 +261,9 @@ export class NativeVideoCompressorWeb extends WebPlugin implements NativeVideoCo
 
   private async canUseWebCodecs(quality: VideoQuality): Promise<boolean> {
     try {
-      const { bitrate } = WEBCODECS_LADDER[quality];
+      const { bitrate } = QUALITY_LADDER[quality];
       return await canEncodeVideo('avc', {
+        hardwareAcceleration: 'no-preference',
         quality: new Quality({ quantizer: WEBCODECS_QUANTIZER, bitrate }),
       });
     } catch {
@@ -214,37 +276,66 @@ export class NativeVideoCompressorWeb extends WebPlugin implements NativeVideoCo
     quality: VideoQuality,
     throwIfCancelled: () => void,
   ): Promise<CompressResult | null> {
-    const { height, bitrate } = WEBCODECS_LADDER[quality];
-
-    const input = new Input({ formats: ALL_FORMATS, source: new BlobSource(blob) });
-    const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
-
-    // Cap fps at 30, but never upsample: probe the source and take the min.
-    // A failed probe just omits frameRate, leaving the source rate untouched.
-    let frameRate: number | undefined;
+    const opfs = await createOpfsOutput();
+    console.log(`[compress] engine=webcodecs target=${opfs ? 'opfs' : 'buffer'}`);
+    let output: Output | undefined;
+    let kept = false;
     try {
-      const track = await input.getPrimaryVideoTrack();
-      if (track) {
-        const stats = await track.computePacketStats(100);
-        if (stats.averagePacketRate > 0) {
-          frameRate = Math.min(FPS_CAP, Math.round(stats.averagePacketRate));
-        }
+      const input = new Input({ formats: ALL_FORMATS, source: new BlobSource(blob) });
+      output = new Output({
+        format: new Mp4OutputFormat(),
+        target: opfs ? new StreamTarget(opfs.writable, { chunked: true }) : new BufferTarget(),
+      });
+      if (!(await this.runConversion(input, output, QUALITY_LADDER[quality], throwIfCancelled))) return null;
+      let outBlob: Blob;
+      if (opfs) {
+        outBlob = await opfs.read();
+      } else {
+        const buffer = (output.target as BufferTarget).buffer;
+        if (!buffer) throw new Error('WebCodecs produced no output');
+        outBlob = new Blob([buffer], { type: 'video/mp4' });
       }
-    } catch {
-      frameRate = undefined;
+      kept = true;
+      return { success: true, destPath: URL.createObjectURL(outBlob) };
+    } finally {
+      if (!kept) {
+        // Closes the writable first, which otherwise keeps the entry locked against removal.
+        await output?.cancel().catch(() => undefined);
+        await opfs?.discard();
+      }
     }
+  }
 
+  /** False when mediabunny can't convert this input. */
+  private async runConversion(
+    input: Input,
+    output: Output,
+    { shortSide, bitrate }: { shortSide: number; bitrate: number },
+    throwIfCancelled: () => void,
+  ): Promise<boolean> {
+    const track = await input.getPrimaryVideoTrack();
+    const { frameRate, bitrate: sourceBitrate } = await probeVideoStats(track);
+    const size = track ? webCodecsSize(await track.getDisplayWidth(), await track.getDisplayHeight(), shortSide) : {};
     throwIfCancelled();
 
     const conversion = await Conversion.init({
       input,
       output,
       video: {
-        height,
-        quality: new Quality({ quantizer: WEBCODECS_QUANTIZER, bitrate }),
-        hardwareAcceleration: 'prefer-hardware',
+        ...size,
+        quality: new Quality({
+          quantizer: WEBCODECS_QUANTIZER,
+          bitrate: capBitrate(bitrate, sourceBitrate, MIN_VIDEO_BITRATE, codecHeadroom(track?.codec)),
+        }),
+        // Not 'prefer-hardware': machines without a hardware H.264 encoder
+        // (Linux, VMs, headless) then fail mid-encode and drop to ffmpeg.wasm.
+        // The browser still picks the hardware encoder when it has one, and the
+        // canEncodeVideo probe asks the same question, so probe and encode agree.
+        hardwareAcceleration: 'no-preference',
         ...(frameRate ? { frameRate } : {}),
       },
+      // The default copies the input's raw udta metadata tags, GPS location included.
+      tags: {},
     });
 
     if (!conversion.isValid) {
@@ -252,46 +343,42 @@ export class NativeVideoCompressorWeb extends WebPlugin implements NativeVideoCo
         '[compress] WebCodecs conversion invalid:',
         conversion.discardedTracks.map((t) => t.reason),
       );
-      return null;
+      return false;
     }
 
+    throwIfCancelled();
     this.activeConversion = conversion;
 
     this.notifyListeners('onProgress', { status: 'started', percent: 0 });
     conversion.onProgress = (progress) => {
-      this.notifyListeners('onProgress', { status: 'progress', percent: Math.round(progress * 100) });
+      if (this.activeConversion === conversion)
+        this.notifyListeners('onProgress', { status: 'progress', percent: Math.round(progress * 100) });
     };
 
-    throwIfCancelled();
     try {
       await conversion.execute();
     } catch (e: any) {
-      if (this.cancelRequested || e instanceof ConversionCanceledError) throw new CancelledError();
+      if (this.cancelRequested || e instanceof ConversionCanceledError) throw cancelledError();
       throw e;
     }
-
-    const buffer = output.target.buffer;
-    if (!buffer) throw new Error('WebCodecs produced no output');
-
-    const outBlob = new Blob([buffer], { type: 'video/mp4' });
-    return { success: true, destPath: URL.createObjectURL(outBlob) };
+    throwIfCancelled();
+    return true;
   }
 
-  private async loadFFmpeg() {
+  private async loadFFmpeg(throwIfCancelled: () => void) {
     if (this.isLoaded && this.ffmpeg) return;
+    throwIfCancelled();
 
     this.notifyListeners('onProgress', { status: 'loading_core', percent: 0 });
 
-    // Built on a local, published to the field only once it is ready and still
-    // wanted. Assigning `this.ffmpeg` up front and setting `isLoaded` after the
-    // await left a window where a cancel could null the instance and the load,
-    // finishing a moment later, would set `isLoaded = true` on nothing at all —
-    // after which every compressVideo threw 'FFmpeg failed to load' for the
-    // rest of the page's life.
+    // Published only once loaded and still wanted, so a cancel mid-load can't leave `isLoaded` set on a dropped instance.
     const instance = new FFmpeg();
 
     instance.on('progress', ({ progress }) => {
-      this.notifyListeners('onProgress', { status: 'progress', percent: Math.round(progress * 100) });
+      // Once published the instance serves every later job; before that, or
+      // after cancel() dropped it, its events belong to no job.
+      if (this.ffmpeg === instance)
+        this.notifyListeners('onProgress', { status: 'progress', percent: Math.round(progress * 100) });
     });
 
     instance.on('log', ({ message }) => {
@@ -308,9 +395,11 @@ export class NativeVideoCompressorWeb extends WebPlugin implements NativeVideoCo
 
     // Cancelled while this was loading. Terminate what we just built rather
     // than publish it — the caller asked for none of it.
-    if (this.cancelRequested) {
+    try {
+      throwIfCancelled();
+    } catch (e) {
       instance.terminate();
-      throw new CancelledError();
+      throw e;
     }
 
     this.ffmpeg = instance;
@@ -323,7 +412,7 @@ export class NativeVideoCompressorWeb extends WebPlugin implements NativeVideoCo
     throwIfCancelled: () => void,
   ): Promise<CompressResult> {
     if (!this.isLoaded) {
-      await this.loadFFmpeg();
+      await this.loadFFmpeg(throwIfCancelled);
     }
     throwIfCancelled();
 
@@ -332,76 +421,44 @@ export class NativeVideoCompressorWeb extends WebPlugin implements NativeVideoCo
     }
     // Bound once. `this.ffmpeg` is nulled by cancel(), so reading it after any
     // of the awaits below can hand back null on a reference the compiler
-    // narrowed here — surfacing a cancel as a TypeError, not a CancelledError.
+    // narrowed here — surfacing a cancel as a TypeError, not a CANCELLED error.
     const ffmpeg = this.ffmpeg;
 
+    console.log('[compress] engine=ffmpeg');
     this.notifyListeners('onProgress', { status: 'started', percent: 0 });
 
     const inputFileName = 'input.mp4';
     const outputFileName = 'output.mp4';
 
-    let crf = '28';
-    let scale = '';
-    let audioBitrate = '128k';
-
-    switch (quality) {
-      case 'VERY_HIGH':
-        crf = '23';
-        scale = '-vf scale=-2:1080';
-        audioBitrate = '128k';
-        break;
-      case 'HIGH':
-        crf = '28';
-        scale = '-vf scale=-2:720';
-        audioBitrate = '128k';
-        break;
-      case 'MEDIUM':
-        crf = '30';
-        scale = '-vf scale=-2:540';
-        audioBitrate = '96k';
-        break;
-      case 'LOW':
-        crf = '32';
-        scale = '-vf scale=-2:480';
-        audioBitrate = '96k';
-        break;
-      case '360P':
-        crf = '28';
-        scale = '-vf scale=-2:360';
-        audioBitrate = '64k';
-        break;
-      case 'VERY_LOW':
-        crf = '35';
-        scale = '-vf scale=-2:240';
-        audioBitrate = '48k';
-        break;
-    }
+    const { shortSide, crf, audioBitrate } = QUALITY_LADDER[quality];
 
     const inputData = new Uint8Array(await blob.arrayBuffer());
 
     try {
       await ffmpeg.writeFile(inputFileName, inputData);
     } catch (err) {
-      if (this.cancelRequested) throw new CancelledError();
+      throwIfCancelled();
       console.error('[FFmpeg] Error writing to FS:', err);
       throw new Error('Could not write to FFmpeg FS');
     }
     throwIfCancelled();
 
-    const args: string[] = ['-i', inputFileName];
-    args.push('-c:v', 'libx264', '-preset', 'superfast', '-crf', crf);
-    if (scale) {
-      args.push(...scale.split(' '));
-    }
-    args.push('-c:a', 'aac', '-b:a', audioBitrate);
-    args.push(outputFileName);
+    // ffmpeg copies global metadata by default, including the GPS location (©xyz / loci).
+    // prettier-ignore
+    const args = [
+      '-i', inputFileName, '-map_metadata', '-1',
+      '-c:v', 'libx264', '-preset', 'superfast', '-crf', String(crf),
+      '-vf', ffmpegScaleFilter(shortSide),
+      '-c:a', 'aac', '-b:a', audioBitrate,
+      outputFileName,
+    ];
 
     try {
       await ffmpeg.exec(args);
     } catch (err) {
       // terminate() rejects every in-flight call, so a cancel arrives here
       // looking like a generic failure unless we name it.
-      if (this.cancelRequested) throw new CancelledError();
+      throwIfCancelled();
       console.error('[FFmpeg] Error executing command:', err);
       throw new Error('FFmpeg execution failed');
     }
@@ -411,7 +468,7 @@ export class NativeVideoCompressorWeb extends WebPlugin implements NativeVideoCo
     try {
       data = await ffmpeg.readFile(outputFileName);
     } catch (err) {
-      if (this.cancelRequested) throw new CancelledError();
+      throwIfCancelled();
       console.error('[FFmpeg] Error reading output file:', err);
       throw new Error('Could not read FFmpeg output');
     }
